@@ -71,6 +71,18 @@ st.markdown(
         border-radius: 8px !important;
         padding: 1rem !important;
     }
+    /* 隐藏 Streamlit Cloud 右上角工具栏 */
+    button[kind="icon"],
+    button[data-testid="baseButton-headerNoSecondary"],
+    button[aria-label="Main menu"],
+    div[data-testid="stToolbar"],
+    div[data-testid="stHeaderActionElements"] {
+        display: none !important;
+        visibility: hidden !important;
+    }
+    header[data-testid="stHeader"] {
+        background-color: transparent !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -95,6 +107,8 @@ if "invoices" not in st.session_state:
     st.session_state.invoices = []
 if "generated_excel" not in st.session_state:
     st.session_state.generated_excel = None
+if "current_step" not in st.session_state:
+    st.session_state.current_step = 0
 
 
 # ========== 侧边栏：配置区 ==========
@@ -182,17 +196,27 @@ st.title("📋 报销助手智能体")
 st.caption("上传压缩包、Excel模板和工作描述，自动生成报销单")
 
 # 步骤导航
-step = st.radio(
-    "操作步骤",
-    ["1️⃣ 上传文件", "2️⃣ 预览与编辑", "3️⃣ 生成报销单"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    if st.button("1️⃣ 上传文件", use_container_width=True, type="primary" if st.session_state.current_step == 0 else "secondary"):
+        st.session_state.current_step = 0
+        st.rerun()
+with col_b:
+    if st.button("2️⃣ 预览与编辑", use_container_width=True, type="primary" if st.session_state.current_step == 1 else "secondary"):
+        st.session_state.current_step = 1
+        st.rerun()
+with col_c:
+    if st.button("3️⃣ 生成报销单", use_container_width=True, type="primary" if st.session_state.current_step == 2 else "secondary"):
+        st.session_state.current_step = 2
+        st.rerun()
 
 st.divider()
 
+# 根据 current_step 确定当前步骤
+step_index = st.session_state.current_step
+
 # ========== 步骤1：上传文件 ==========
-if step == "1️⃣ 上传文件":
+if step_index == 0:
     st.header("步骤一：上传必要文件")
 
     col1, col2 = st.columns(2)
@@ -327,11 +351,13 @@ if step == "1️⃣ 上传文件":
                 + f"，共{sum(travel_days.values())}天"
             )
 
-        st.success("🎉 所有文件解析完成！请切换到「预览与编辑」查看结果")
+        st.success("🎉 所有文件解析完成！正在跳转到预览页面...")
+        st.session_state.current_step = 1
+        st.rerun()
 
 
 # ========== 步骤2：预览与编辑 ==========
-elif step == "2️⃣ 预览与编辑":
+elif step_index == 1:
     st.header("步骤二：预览与编辑解析结果")
 
     if not st.session_state.invoices:
@@ -362,7 +388,7 @@ elif step == "2️⃣ 预览与编辑":
                     options=EXPENSE_TYPES,
                     index=EXPENSE_TYPES.index(inv.get("type", "其他"))
                     if inv.get("type", "其他") in EXPENSE_TYPES
-                    else 8,
+                    else EXPENSE_TYPES.index("其他"),
                     key=f"type_{i}",
                 )
                 inv["amount"] = st.text_input(
@@ -414,6 +440,15 @@ elif step == "2️⃣ 预览与编辑":
                         key=f"rate_{i}",
                     )
 
+            # 餐饮发票：标记是否为请客（请客才计入报销）
+            if inv.get("type") == "餐饮":
+                inv["is_entertainment"] = st.checkbox(
+                    "🍽️ 请客发票（按实际金额计入报销）",
+                    value=inv.get("is_entertainment", False),
+                    key=f"entertain_{i}",
+                    help="餐饮发票一般作为补贴替票，不计入报销总额。勾选此项表示该发票为请客用餐，将按实际金额计入报销。",
+                )
+
             # 显示原始文本
             with st.expander("📄 查看原始识别文本", expanded=False):
                 st.text(inv.get("raw_text", "无"))
@@ -430,7 +465,9 @@ elif step == "2️⃣ 预览与编辑":
                 inv["amount"] = 0.0
 
         st.session_state.invoices = edited_invoices
-        st.success("✅ 修改已保存")
+        st.success("✅ 修改已保存，正在跳转...")
+        st.session_state.current_step = 2
+        st.rerun()
 
     # 出差天数统计
     st.divider()
@@ -448,7 +485,7 @@ elif step == "2️⃣ 预览与编辑":
 
 
 # ========== 步骤3：生成报销单 ==========
-elif step == "3️⃣ 生成报销单":
+elif step_index == 2:
     st.header("步骤三：生成报销单")
 
     if not st.session_state.invoices:
@@ -469,10 +506,15 @@ elif step == "3️⃣ 生成报销单":
     with col1:
         st.metric("票据总数", f"{len(invoices)} 张")
     with col2:
-        total_amount = sum(
+        total_all = sum(float(inv.get("amount", 0)) for inv in invoices)
+        meal_exclude = sum(
             float(inv.get("amount", 0)) for inv in invoices
+            if inv.get("type") == "餐饮" and not inv.get("is_entertainment", False)
         )
-        st.metric("票据总金额", f"¥{total_amount:.2f}")
+        total_reimburse = total_all - meal_exclude
+        st.metric("报销总金额", f"¥{total_reimburse:.2f}")
+        if meal_exclude > 0:
+            st.caption(f"含票据¥{total_all:.2f}，已扣除补贴替票餐费¥{meal_exclude:.2f}")
     with col3:
         total_days = sum(travel_days.values())
         st.metric("出差天数", f"{total_days} 天")
