@@ -15,6 +15,7 @@ from config import (
     load_prompt,
     PROMPT_NAMES,
     get_api_key,
+    get_builtin_template_bytes,
 )
 from services.zip_extractor import ZipExtractor
 from services.invoice_parser import InvoiceParser
@@ -182,7 +183,7 @@ with st.sidebar:
 
 # ========== 主区域 ==========
 st.title("📋 报销助手智能体")
-st.caption("上传压缩包、Excel模板和工作描述，自动生成报销单")
+st.caption("上传发票压缩包和工作描述，自动生成报销单")
 
 # 步骤导航
 col_a, col_b, col_c = st.columns(3)
@@ -211,17 +212,6 @@ if step_index == 0:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("📄 Excel 报销模板")
-        template_file = st.file_uploader(
-            "上传空白 Excel 报销模板",
-            type=["xlsx", "xls"],
-            key="template_upload",
-            help="上传当月的空白报销Excel模板文件",
-        )
-        if template_file:
-            st.success(f"✅ 模板已上传: {template_file.name}")
-
-    with col2:
         st.subheader("📦 发票压缩包")
         zip_file = st.file_uploader(
             "上传发票压缩包 (ZIP格式)",
@@ -231,6 +221,19 @@ if step_index == 0:
         )
         if zip_file:
             st.success(f"✅ 压缩包已上传: {zip_file.name}")
+
+    with col2:
+        st.subheader("📄 报销模板")
+        st.info("✅ 已使用内置模板（自动生成当月）")
+        # 可选：自定义模板覆盖
+        template_file = st.file_uploader(
+            "自定义模板（可选）",
+            type=["xlsx", "xls"],
+            key="template_upload",
+            help="可选：上传自定义Excel模板覆盖内置模板",
+        )
+        if template_file:
+            st.success(f"✅ 自定义模板已上传: {template_file.name}")
 
     st.divider()
     st.subheader("💼 当月工作内容描述")
@@ -253,12 +256,11 @@ if step_index == 0:
             st.error("❌ 请上传发票压缩包")
             st.stop()
 
-        if not template_file:
-            st.error("❌ 请上传 Excel 报销模板")
-            st.stop()
-
-        # 保存模板
-        st.session_state.template_bytes = template_file.getvalue()
+        # 保存模板（优先自定义，否则用内置）
+        if template_file:
+            st.session_state.template_bytes = template_file.getvalue()
+        else:
+            st.session_state.template_bytes = get_builtin_template_bytes()
         st.session_state.work_description = work_description
 
         # 解压压缩包
@@ -511,8 +513,8 @@ elif step_index == 2:
         st.stop()
 
     if not hasattr(st.session_state, "template_bytes"):
-        st.warning("⚠️ 请先在步骤一上传 Excel 模板")
-        st.stop()
+        # 自动加载内置模板
+        st.session_state.template_bytes = get_builtin_template_bytes()
 
     # 数据汇总
     invoices = st.session_state.invoices

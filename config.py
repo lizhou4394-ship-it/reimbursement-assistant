@@ -1,5 +1,6 @@
 """配置管理模块"""
 import os
+import io
 from dotenv import load_dotenv
 
 # 加载 .env 文件
@@ -97,3 +98,36 @@ def get_api_key(session_api_key: str = "") -> str:
     if session_api_key:
         return session_api_key
     return DASHSCOPE_API_KEY
+
+
+# 内置空白报销模板路径
+BUILTIN_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(__file__), "templates", "blank_template.xlsx"
+)
+
+
+def get_builtin_template_bytes() -> bytes:
+    """加载内置空白报销模板（动态生成当月标题）"""
+    import openpyxl
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime
+
+    # 优先读取静态模板文件
+    try:
+        with open(BUILTIN_TEMPLATE_PATH, "rb") as f:
+            static_bytes = f.read()
+        wb = openpyxl.load_workbook(io.BytesIO(static_bytes))
+        ws = wb.active
+    except FileNotFoundError:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = '报销单'
+
+    # 动态更新标题月份
+    month = datetime.now().month
+    ws['A1'] = f'{month}月 浙江地区行程报销单'
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
