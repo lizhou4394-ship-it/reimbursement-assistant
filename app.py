@@ -207,33 +207,17 @@ step_index = st.session_state.current_step
 
 # ========== 步骤1：上传文件 ==========
 if step_index == 0:
-    st.header("步骤一：上传必要文件")
+    st.header("步骤一：上传发票并解析")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("📦 发票压缩包")
-        zip_file = st.file_uploader(
-            "上传发票压缩包 (ZIP格式)",
-            type=["zip"],
-            key="zip_upload",
-            help="上传包含所有发票和行程单的ZIP压缩包（支持PDF和图片）",
-        )
-        if zip_file:
-            st.success(f"✅ 压缩包已上传: {zip_file.name}")
-
-    with col2:
-        st.subheader("📄 报销模板")
-        st.info("✅ 已使用内置模板（自动生成当月）")
-        # 可选：自定义模板覆盖
-        template_file = st.file_uploader(
-            "自定义模板（可选）",
-            type=["xlsx", "xls"],
-            key="template_upload",
-            help="可选：上传自定义Excel模板覆盖内置模板",
-        )
-        if template_file:
-            st.success(f"✅ 自定义模板已上传: {template_file.name}")
+    st.subheader("📦 发票压缩包")
+    zip_file = st.file_uploader(
+        "上传发票压缩包 (ZIP格式)",
+        type=["zip"],
+        key="zip_upload",
+        help="上传包含所有发票和行程单的ZIP压缩包（支持PDF和图片）",
+    )
+    if zip_file:
+        st.success(f"✅ 压缩包已上传: {zip_file.name}")
 
     st.divider()
     st.subheader("💼 当月工作内容描述")
@@ -256,11 +240,8 @@ if step_index == 0:
             st.error("❌ 请上传发票压缩包")
             st.stop()
 
-        # 保存模板（优先自定义，否则用内置）
-        if template_file:
-            st.session_state.template_bytes = template_file.getvalue()
-        else:
-            st.session_state.template_bytes = get_builtin_template_bytes()
+        # 加载内置模板
+        st.session_state.template_bytes = get_builtin_template_bytes()
         st.session_state.work_description = work_description
 
         # 解压压缩包
