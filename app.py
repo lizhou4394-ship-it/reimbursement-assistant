@@ -83,6 +83,25 @@ st.markdown(
     header[data-testid="stHeader"] {
         background-color: transparent !important;
     }
+    /* 窄屏 metric 自适应 */
+    @media (max-width: 900px) {
+        div[data-testid="stMetric"] {
+            min-width: 0 !important;
+        }
+        div[data-testid="stMetric"] label {
+            font-size: 0.8rem !important;
+        }
+        div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+            font-size: 1.2rem !important;
+        }
+    }
+    /* 分类标签样式 */
+    .category-header {
+        background: linear-gradient(90deg, #f0f2f6 0%, transparent 100%);
+        padding: 8px 12px;
+        border-radius: 6px;
+        margin-bottom: 4px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -133,38 +152,8 @@ with st.sidebar:
         help="推荐使用 qwen-vl-max，视觉识别能力最强",
     )
 
-    # API 额度查询
-    with st.expander("💰 API 额度查询", expanded=False):
-        if st.button("🔄 查询剩余额度"):
-            try:
-                import dashscope
-                dashscope.api_key = st.session_state.api_key or default_key
-                # 调用一次轻量级接口测试 Key 是否有效
-                from dashscope import Generation
-                resp = Generation.call(
-                    model="qwen-turbo",
-                    messages=[{"role": "user", "content": "hi"}],
-                    result_format="message",
-                )
-                if resp.status_code == 200:
-                    usage = resp.usage
-                    st.success("✅ API Key 有效")
-                    if hasattr(usage, "total_tokens"):
-                        st.info(f"本次调用消耗 Token: {usage.total_tokens}")
-                    st.markdown(
-                        "👉 [点击查看免费额度](https://bailian.console.aliyun.com/cn-beijing#/free-quota)"
-                    )
-                    st.markdown(
-                        "👉 [点击查看用量统计](https://bailian.console.aliyun.com/cn-beijing#/usage-statistics)"
-                    )
-                else:
-                    st.error(f"❌ API Key 无效或已过期: {resp.message}")
-            except Exception as e:
-                st.error(f"❌ 查询失败: {e}")
-        st.caption("通义千问 qwen-vl-max 每月有免费额度，正常报销单使用绰绰有余")
-
     st.divider()
-
+    
     # 提示词配置
     st.subheader("📝 提示词配置")
 
@@ -238,7 +227,7 @@ if step_index == 0:
             "上传发票压缩包 (ZIP格式)",
             type=["zip"],
             key="zip_upload",
-            help="上传包含所有发票和行程单的ZIP压缩包",
+            help="上传包含所有发票和行程单的ZIP压缩包（支持PDF和图片）",
         )
         if zip_file:
             st.success(f"✅ 压缩包已上传: {zip_file.name}")
@@ -258,8 +247,7 @@ if step_index == 0:
     if st.button("🚀 开始解析发票", type="primary", use_container_width=True):
         # 验证输入
         if not st.session_state.api_key:
-            st.error("❌ 请在侧边栏填写 API Key")
-            st.stop()
+            st.warning("⚠️ 未填写 API Key，酒店日期推算和照片解析将不可用，其余功能正常")
 
         if not zip_file:
             st.error("❌ 请上传发票压缩包")
@@ -285,8 +273,8 @@ if step_index == 0:
                 f"(图片: {img_count}, PDF: {pdf_count})"
             )
 
-        # 展示解压的文件列表
-        with st.expander("📁 查看解压文件列表", expanded=True):
+        # 展示解压的文件列表（默认收起）
+        with st.expander(f"📁 解压完成，共 {len(file_list)} 个文件（点击展开详情）", expanded=False):
             for f in file_list:
                 icon = "🖼️" if f["type"] == "image" else "📄"
                 img_count = len(f.get("images", []))
@@ -366,105 +354,135 @@ elif step_index == 1:
 
     invoices = st.session_state.invoices
 
-    st.subheader("📊 发票解析结果")
-    st.caption("可在此检查和修正识别结果，修改后点击「保存修改」")
+    # ---- 汇总摘要 ----
+    from collections import Counter
+    type_counts = Counter(inv.get("type", "其他") for inv in invoices)
+    summary_parts = [f"{t}: {c}张" for t, c in type_counts.items()]
+    st.info(f"📊 共 {len(invoices)} 张票据 — " + "、".join(summary_parts))
 
-    # 展示为可编辑表格
-    edited_invoices = []
-    for i, inv in enumerate(invoices):
-        with st.expander(
-            f"📋 #{i+1} | {inv.get('type', '未知')} | "
-            f"日期: {inv.get('date', '')} | "
-            f"金额: {inv.get('amount', '')}",
-            expanded=False,
-        ):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                inv["date"] = st.text_input(
-                    "日期", value=inv.get("date", ""), key=f"date_{i}"
-                )
-                inv["type"] = st.selectbox(
-                    "费用类型",
-                    options=EXPENSE_TYPES,
-                    index=EXPENSE_TYPES.index(inv.get("type", "其他"))
-                    if inv.get("type", "其他") in EXPENSE_TYPES
-                    else EXPENSE_TYPES.index("其他"),
-                    key=f"type_{i}",
-                )
-                inv["amount"] = st.text_input(
-                    "金额", value=str(inv.get("amount", "")), key=f"amount_{i}"
-                )
+    # ---- 分类 tabs ----
+    # 定义分类顺序和图标
+    CATEGORY_ORDER = [
+        ("🚄 火车票", "火车票"),
+        ("🚖 打车", "打车"),
+        ("✈️ 飞机票", "飞机票"),
+        ("🏨 酒店", "酒店"),
+        ("🍽️ 餐饮", "餐饮"),
+        ("📦 快递/其他", None),  # None = 其余类型
+    ]
 
-            with col2:
-                inv["start_location"] = st.text_input(
-                    "起点",
-                    value=inv.get("start_location", ""),
-                    key=f"start_{i}",
-                )
-                inv["end_location"] = st.text_input(
-                    "终点",
-                    value=inv.get("end_location", ""),
-                    key=f"end_{i}",
-                )
+    # 构建分类数据
+    categorized = {}
+    for label, type_key in CATEGORY_ORDER:
+        if type_key:
+            items = [(i, inv) for i, inv in enumerate(invoices) if inv.get("type") == type_key]
+        else:
+            known_types = {t for _, t in CATEGORY_ORDER if t}
+            items = [(i, inv) for i, inv in enumerate(invoices) if inv.get("type", "其他") not in known_types]
+        if items:
+            categorized[label] = items
 
-            with col3:
-                inv["work_content"] = st.text_input(
-                    "工作内容",
-                    value=inv.get("work_content", ""),
-                    key=f"work_{i}",
-                )
-                if inv.get("type") == "酒店":
-                    inv["hotel_name"] = st.text_input(
-                        "酒店名称",
-                        value=inv.get("hotel_name", ""),
-                        key=f"hotel_{i}",
-                    )
-                    inv["check_in_date"] = st.text_input(
-                        "入住日期",
-                        value=inv.get("check_in_date", ""),
-                        key=f"checkin_{i}",
-                    )
-                    inv["check_out_date"] = st.text_input(
-                        "离店日期",
-                        value=inv.get("check_out_date", ""),
-                        key=f"checkout_{i}",
-                    )
-                    inv["nights"] = st.text_input(
-                        "住宿天数",
-                        value=str(inv.get("nights", "")),
-                        key=f"nights_{i}",
-                    )
-                    inv["daily_rate"] = st.text_input(
-                        "单日单价",
-                        value=str(inv.get("daily_rate", "")),
-                        key=f"rate_{i}",
-                    )
+    tab_labels = list(categorized.keys())
+    if len(tab_labels) > 1:
+        tabs = st.tabs(tab_labels)
+    else:
+        tabs = [st.container()]
 
-            # 餐饮发票：标记是否为请客（请客才计入报销）
-            if inv.get("type") == "餐饮":
-                inv["is_entertainment"] = st.checkbox(
-                    "🍽️ 请客发票（按实际金额计入报销）",
-                    value=inv.get("is_entertainment", False),
-                    key=f"entertain_{i}",
-                    help="餐饮发票一般作为补贴替票，不计入报销总额。勾选此项表示该发票为请客用餐，将按实际金额计入报销。",
-                )
+    edited_invoices = list(invoices)  # shallow copy
 
-            # 显示原始文本
-            with st.expander("📄 查看原始识别文本", expanded=False):
-                st.text(inv.get("raw_text", "无"))
+    for tab_idx, (label, items) in enumerate(categorized.items()):
+        container = tabs[tab_idx] if len(tab_labels) > 1 else tabs[0]
+        with container:
+            # 分类小计
+            cat_total = sum(float(inv.get("amount", 0)) for _, inv in items)
+            st.caption(f"{len(items)} 张，合计 ¥{cat_total:.2f}")
 
-            edited_invoices.append(inv)
+            for i, inv in items:
+                with st.expander(
+                    f"#{i+1} | {inv.get('date', '')} | "
+                    f"{inv.get('start_location', '')}{(' → ' + inv.get('end_location', '')) if inv.get('end_location') else ''} | "
+                    f"¥{inv.get('amount', '')}",
+                    expanded=False,
+                ):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        inv["date"] = st.text_input(
+                            "日期", value=inv.get("date", ""), key=f"date_{i}"
+                        )
+                        inv["type"] = st.selectbox(
+                            "费用类型",
+                            options=EXPENSE_TYPES,
+                            index=EXPENSE_TYPES.index(inv.get("type", "其他"))
+                            if inv.get("type", "其他") in EXPENSE_TYPES
+                            else EXPENSE_TYPES.index("其他"),
+                            key=f"type_{i}",
+                        )
+                        inv["amount"] = st.text_input(
+                            "金额", value=str(inv.get("amount", "")), key=f"amount_{i}"
+                        )
+
+                    with col2:
+                        inv["start_location"] = st.text_input(
+                            "起点", value=inv.get("start_location", ""), key=f"start_{i}",
+                        )
+                        inv["end_location"] = st.text_input(
+                            "终点", value=inv.get("end_location", ""), key=f"end_{i}",
+                        )
+
+                    with col3:
+                        inv["work_content"] = st.text_input(
+                            "工作内容", value=inv.get("work_content", ""), key=f"work_{i}",
+                        )
+                        if inv.get("type") == "酒店":
+                            inv["hotel_name"] = st.text_input(
+                                "酒店名称", value=inv.get("hotel_name", ""), key=f"hotel_{i}",
+                            )
+                            inv["check_in_date"] = st.text_input(
+                                "入住日期", value=inv.get("check_in_date", ""), key=f"checkin_{i}",
+                            )
+                            inv["check_out_date"] = st.text_input(
+                                "离店日期", value=inv.get("check_out_date", ""), key=f"checkout_{i}",
+                            )
+                            inv["nights"] = st.text_input(
+                                "住宿天数", value=str(inv.get("nights", "")), key=f"nights_{i}",
+                            )
+                            inv["daily_rate"] = st.text_input(
+                                "单日单价", value=str(inv.get("daily_rate", "")), key=f"rate_{i}",
+                            )
+
+                    # 餐饮发票：标记是否为请客
+                    if inv.get("type") == "餐饮":
+                        inv["is_entertainment"] = st.checkbox(
+                            "🍽️ 请客发票（按实际金额计入报销）",
+                            value=inv.get("is_entertainment", False),
+                            key=f"entertain_{i}",
+                            help="餐饮发票一般作为补贴替票，不计入报销总额。勾选此项表示该发票为请客用餐，将按实际金额计入报销。",
+                        )
+
+                    # 打车行程：仅顺风车需餐费代替
+                    if inv.get("type") == "打车" and "顺风车" in inv.get("car_type", ""):
+                        inv["need_substitute"] = st.checkbox(
+                            f"🚗 餐费代替（{inv.get('car_type', '')}）",
+                            value=inv.get("need_substitute", False),
+                            key=f"substitute_{i}",
+                            help="顺风车无滴滴发票，需用餐饮发票代替。",
+                        )
+
+                    # 原始识别文本
+                    with st.expander("📄 查看原始识别文本", expanded=False):
+                        st.text(inv.get("raw_text", "无"))
+
+    st.session_state.invoices = edited_invoices
 
     # 保存修改按钮
-    if st.button("💾 保存修改", type="primary"):
-        # 更新金额类型
+    if st.button("💾 保存修改", type="primary", use_container_width=True):
         for inv in edited_invoices:
             try:
                 inv["amount"] = float(inv.get("amount", 0))
             except ValueError:
                 inv["amount"] = 0.0
-
         st.session_state.invoices = edited_invoices
+        st.session_state.generated_excel = None  # 清除已生成的Excel，步骤3重新生成
         st.success("✅ 修改已保存，正在跳转...")
         st.session_state.current_step = 2
         st.rerun()
@@ -502,30 +520,35 @@ elif step_index == 2:
     work_description = st.session_state.get("work_description", "")
 
     st.subheader("📊 数据汇总")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
+    total_all = sum(float(inv.get("amount", 0)) for inv in invoices)
+    meal_exclude = sum(
+        float(inv.get("amount", 0)) for inv in invoices
+        if inv.get("type") == "餐饮" and not inv.get("is_entertainment", False)
+    )
+    total_reimburse = total_all - meal_exclude
+    total_days = sum(travel_days.values())
+    subsidy = total_days * 50
+
+    # 2x2 布局（窄屏友好）
+    row1_col1, row1_col2 = st.columns(2)
+    with row1_col1:
         st.metric("票据总数", f"{len(invoices)} 张")
-    with col2:
-        total_all = sum(float(inv.get("amount", 0)) for inv in invoices)
-        meal_exclude = sum(
-            float(inv.get("amount", 0)) for inv in invoices
-            if inv.get("type") == "餐饮" and not inv.get("is_entertainment", False)
-        )
-        total_reimburse = total_all - meal_exclude
+    with row1_col2:
         st.metric("报销总金额", f"¥{total_reimburse:.2f}")
-        if meal_exclude > 0:
-            st.caption(f"含票据¥{total_all:.2f}，已扣除补贴替票餐费¥{meal_exclude:.2f}")
-    with col3:
-        total_days = sum(travel_days.values())
+
+    row2_col1, row2_col2 = st.columns(2)
+    with row2_col1:
         st.metric("出差天数", f"{total_days} 天")
-    with col4:
-        subsidy = total_days * 50
+    with row2_col2:
         st.metric("出差补贴", f"¥{subsidy:.2f}")
+
+    if meal_exclude > 0:
+        st.caption(f"含票据¥{total_all:.2f}，已扣除补贴替票餐费¥{meal_exclude:.2f}")
 
     st.divider()
 
-    # 生成按钮
-    if st.button("📝 生成报销 Excel", type="primary", use_container_width=True):
+    # 自动生成 Excel（进入步骤3时立即执行）
+    if not st.session_state.generated_excel:
         with st.spinner("🔄 正在生成报销单..."):
             try:
                 generator = ExcelGenerator(st.session_state.template_bytes)
@@ -535,14 +558,12 @@ elif step_index == 2:
                     work_description=work_description,
                 )
                 st.session_state.generated_excel = excel_bytes
-                st.success("✅ 报销单生成成功！")
             except Exception as e:
                 st.error(f"❌ 生成失败: {e}")
 
-    # 下载按钮
+    # 直接显示下载按钮
     if st.session_state.generated_excel:
-        st.divider()
-        st.subheader("⬇️ 下载报销单")
+        st.success("✅ 报销单已生成，点击下方按钮下载")
 
         st.download_button(
             label="📥 下载报销 Excel 文件",
@@ -552,3 +573,8 @@ elif step_index == 2:
             type="primary",
             use_container_width=True,
         )
+
+        # 重新生成按钮（数据修改后可重新生成）
+        if st.button("🔄 重新生成", use_container_width=True):
+            st.session_state.generated_excel = None
+            st.rerun()

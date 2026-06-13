@@ -21,3 +21,8 @@ Thumbs.db
 # 临时文件
 tmp/
 *.tmp
+output.txt
+test_output.xlsx
+
+# 测试数据
+*.zip

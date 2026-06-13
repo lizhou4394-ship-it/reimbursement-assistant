@@ -3,11 +3,14 @@ import io
 from typing import List, Dict
 from datetime import datetime
 from openpyxl import load_workbook
-from openpyxl.styles import Font, Alignment, Border, Side
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 
 class ExcelGenerator:
     """报销单Excel生成器 - 匹配用户提供的模板格式"""
+
+    # 灰色表头填充（用于酒店/其他费用的列标题行）
+    _GRAY_FILL = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 
     def __init__(self, template_bytes: bytes):
         self.wb = load_workbook(io.BytesIO(template_bytes))
@@ -26,7 +29,7 @@ class ExcelGenerator:
         # ---- 1. 分类发票 ----
         transport = []   # 火车票 + 打车 + 飞机票
         hotels = []      # 酒店
-        others = []      # 快递、其他
+        others = []      # 快递、其他、请客餐饮
 
         for inv in invoices:
             t = inv.get("type", "")
@@ -34,31 +37,42 @@ class ExcelGenerator:
                 transport.append(inv)
             elif t == "酒店":
                 hotels.append(inv)
+            elif t == "餐饮":
+                # 餐饮发票：仅请客的才写入报销单，非请客的作为补贴替票不写入
+                if inv.get("is_entertainment", False):
+                    others.append(inv)
             elif t in ("快递", "其他"):
                 others.append(inv)
+            # 打车行程单不单独写入，仅用于配对打车发票
 
         # ---- 2. 生成补贴 ----
         subsidies = self._generate_subsidies(travel_days)
 
-        # ---- 3. 按日期排序 ----
-        transport.sort(key=lambda x: x.get("date", ""))
+        # ---- 3. 排序：火车票在前、打车在后，各自按日期排 ----
+        TYPE_ORDER = {"火车票": 0, "飞机票": 1, "打车": 2}
+        transport.sort(key=lambda x: (
+            TYPE_ORDER.get(x.get("type", ""), 9),
+            x.get("date", ""),
+        ))
         hotels.sort(key=lambda x: x.get("check_in_date", x.get("date", "")))
         others.sort(key=lambda x: x.get("date", ""))
 
         # ---- 4. 清除模板 header 以下所有行 ----
-        # 保留 Row1=大标题  Row2=主表头  Row3=子表头
+        # 保留 Row1=大标题  Row2=表头，删除 Row3（空行）
         max_r = self.ws.max_row
         if max_r > 3:
             self.ws.delete_rows(4, max_r - 3)
+        # 删除第3行（模板中的空子表头）
+        self.ws.delete_rows(3, 1)
 
-        cur = 4  # 当前写入行号
+        cur = 3  # 当前写入行号（从第3行开始）
 
         # ---- 5-A. 城际交通：火车票 + 打车 ----
         for inv in transport:
             self._write_transport_row(cur, inv)
             cur += 1
 
-        # 空行分隔
+        # 空行分隔（交通块结束）
         cur += 1
 
         # ---- 5-B. 补贴 ----
@@ -69,26 +83,30 @@ class ExcelGenerator:
             self.ws.cell(row=cur, column=5, value=sub["name"])
             self.ws.cell(row=cur, column=6, value=float(sub["amount"]))
             self.ws.cell(row=cur, column=7, value=sub.get("remark", ""))
-            # 每行 D 列都写汇总摘要（与模板一致）
-            if summary_text:
+            # D 列出差天数汇总摘要只写在第一行（与模板一致）
+            if i == 0 and summary_text:
                 self.ws.cell(row=cur, column=4, value=summary_text)
             cur += 1
+
+        # 空行分隔（补贴块结束）
+        cur += 1
 
         # ---- 5-C. 城际交通小计 ----
         transport_total = sum(float(inv.get("amount", 0)) for inv in transport)
         self.ws.cell(row=cur, column=5, value="城际交通 小计")
+        self.ws.cell(row=cur, column=6, value=round(transport_total, 2))
+        cur += 1
+
+        # 空行分隔（小计结束）
         cur += 1
 
         # ---- 5-D. 住宿费 ----
-        # 写入住宿费的列标题
-        self.ws.cell(row=cur, column=1, value="入住时间段")
-        self.ws.cell(row=cur, column=2, value="酒店名称")
-        self.ws.cell(row=cur, column=3, value="天数")
-        self.ws.cell(row=cur, column=4, value="单价")
-        self.ws.cell(row=cur, column=5, value="费用")
-        self.ws.cell(row=cur, column=6, value="名称")
-        self.ws.cell(row=cur, column=7, value="金额(元)")
-        # 备注列沿用 Row3 的 "备注(超标原因...)"
+        # 写入住宿费的列标题（灰色底）
+        hotel_headers = ["入住时间段", "酒店名称", "天数", "单价", "费用", "名称", "金额(元)"]
+        for col_idx, h in enumerate(hotel_headers, 1):
+            cell = self.ws.cell(row=cur, column=col_idx, value=h)
+            cell.fill = self._GRAY_FILL
+            cell.font = Font(bold=True)
         cur += 1
 
         hotel_total = 0.0
@@ -97,19 +115,24 @@ class ExcelGenerator:
             hotel_total += float(inv.get("amount", 0))
             cur += 1
 
+        # 空行分隔（酒店明细结束）
+        cur += 1
+
         # ---- 5-E. 住宿费小计 ----
         self.ws.cell(row=cur, column=5, value="住宿费")
+        self.ws.cell(row=cur, column=6, value=round(hotel_total, 2))
+        cur += 1
+
+        # 空行分隔（住宿费小计结束）
         cur += 1
 
         # ---- 5-F. 其他费用 ----
-        # 写入其他费用的列标题
-        self.ws.cell(row=cur, column=1, value="日期")
-        self.ws.cell(row=cur, column=2, value="其他费用名称")
-        self.ws.cell(row=cur, column=3, value="")
-        self.ws.cell(row=cur, column=4, value="内容")
-        self.ws.cell(row=cur, column=5, value="费用名称")
-        self.ws.cell(row=cur, column=6, value="金额(元)")
-        self.ws.cell(row=cur, column=7, value="备注(超标原因/替票、替票原因）")
+        # 写入其他费用的列标题（灰色底）
+        other_headers = ["日期", "其他费用名称", "", "内容", "费用名称", "金额(元)", "备注(超标原因/替票、替票原因）"]
+        for col_idx, h in enumerate(other_headers, 1):
+            cell = self.ws.cell(row=cur, column=col_idx, value=h)
+            cell.fill = self._GRAY_FILL
+            cell.font = Font(bold=True)
         cur += 1
 
         other_total = 0.0
@@ -117,6 +140,9 @@ class ExcelGenerator:
             self._write_other_row(cur, inv)
             other_total += float(inv.get("amount", 0))
             cur += 1
+
+        # 空行分隔（其他费用明细结束）
+        cur += 1
 
         # ---- 5-G. 总合计 ----
         subsidy_total = sum(float(s["amount"]) for s in subsidies)
@@ -152,12 +178,17 @@ class ExcelGenerator:
         """
         计算出差天数
 
+        策略：按目的地分组，贪心配对出发↔返回，直接求和
+        - 当天往返=1天，跨天=end-start+1
+        - 外地中转票(X→Y)算作X的出发日
+        - 同一目的地多次出差取sum累加
+
         Returns:
             {地区简称: 天数}  例如 {"桐庐": 2, "衢州": 7}
         """
         travel_days: Dict[str, int] = {}
-        depart_trips: List[Dict] = []
-        return_trips: List[Dict] = []
+        dest_departs: Dict[str, List] = {}  # {目的地: [date, ...]}
+        dest_returns: Dict[str, List] = {}  # {目的地: [date, ...]}
 
         for inv in invoices:
             inv_type = inv.get("type", "")
@@ -168,47 +199,55 @@ class ExcelGenerator:
             if inv_type in ("火车票", "飞机票"):
                 start = inv.get("start_location", "")
                 end = inv.get("end_location", "")
+                start_city = self._extract_city(start)
+                end_city = self._extract_city(end)
 
                 if home_city in start and home_city not in end:
-                    depart_trips.append({
-                        "destination": self._extract_city(end),
-                        "depart_date": date_str,
-                    })
+                    # 从家出发去外地
+                    dest_departs.setdefault(end_city, []).append(
+                        datetime.strptime(date_str, "%Y-%m-%d").date()
+                    )
                 elif home_city in end and home_city not in start:
-                    return_trips.append({
-                        "destination": self._extract_city(start),
-                        "return_date": date_str,
-                    })
+                    # 从外地回家
+                    dest_returns.setdefault(start_city, []).append(
+                        datetime.strptime(date_str, "%Y-%m-%d").date()
+                    )
+                elif home_city not in start and home_city not in end:
+                    # 城际交通：从A城市去B城市，算作离开A城市
+                    if start_city and end_city and start_city != end_city:
+                        dest_departs.setdefault(start_city, []).append(
+                            datetime.strptime(date_str, "%Y-%m-%d").date()
+                        )
 
-        # 配对 出发 ↔ 返回
-        used_returns = set()
-        for dep in depart_trips:
-            dest = dep["destination"]
-            try:
-                dep_date = datetime.strptime(dep["depart_date"], "%Y-%m-%d").date()
-            except ValueError:
+        # 按目的地计算出差天数
+        for dest in set(list(dest_departs.keys()) + list(dest_returns.keys())):
+            departs = sorted(set(dest_departs.get(dest, [])))  # 出发去重
+            returns = sorted(dest_returns.get(dest, []))       # 返回不去重（重复票保留）
+
+            if not departs:
                 continue
 
-            best_return = None
-            for idx, ret in enumerate(return_trips):
-                if idx in used_returns:
-                    continue
-                if dest in ret["destination"] or ret["destination"] in dest:
-                    try:
-                        ret_date = datetime.strptime(ret["return_date"], "%Y-%m-%d").date()
-                    except ValueError:
-                        continue
-                    if ret_date >= dep_date:
-                        if best_return is None or ret_date < best_return["date"]:
-                            best_return = {"idx": idx, "date": ret_date}
+            # 贪心配对：每个出发找最早的未使用返回
+            used = set()
+            segments = []
+            for dep_date in departs:
+                best = None
+                for j, ret_date in enumerate(returns):
+                    if j not in used and ret_date >= dep_date:
+                        best = (dep_date, ret_date, j)
+                        break
+                if best:
+                    segments.append([best[0], best[1]])
+                    used.add(best[2])
+                else:
+                    segments.append([dep_date, dep_date])  # 无返回，按当天往返
 
-            if best_return:
-                used_returns.add(best_return["idx"])
-                days = (best_return["date"] - dep_date).days + 1
-            else:
-                days = 1  # 单日往返
-
-            travel_days[dest] = travel_days.get(dest, 0) + days
+            # 直接求和：当天往返=1天，跨天=end-start+1
+            total = sum(
+                1 if seg[0] == seg[1] else (seg[1] - seg[0]).days + 1
+                for seg in segments
+            )
+            travel_days[dest] = max(travel_days.get(dest, 0), total)
 
         # 酒店也参与天数补充
         for inv in invoices:
@@ -241,7 +280,9 @@ class ExcelGenerator:
         self.ws.cell(row=row, column=4, value=inv.get("work_content", ""))
         self.ws.cell(row=row, column=5, value=inv.get("type", ""))
         self.ws.cell(row=row, column=6, value=float(inv.get("amount", 0)))
-        self.ws.cell(row=row, column=7, value="")
+        # 顺风车/拼车需要餐费代替
+        remark = "餐费代替" if inv.get("need_substitute", False) else ""
+        self.ws.cell(row=row, column=7, value=remark)
 
     def _write_hotel_row(self, row: int, inv: Dict):
         """写入一条酒店记录"""

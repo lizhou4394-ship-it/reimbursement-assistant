@@ -107,6 +107,8 @@ class DataCorrelator:
                     "end_location": itin.get("end_location", ""),
                     "amount": inv_amount,
                     "has_invoice": True,
+                    "need_substitute": itin.get("need_substitute", False),
+                    "car_type": itin.get("car_type", ""),
                     "source_file": invoice.get("source_file", ""),
                     "itinerary_file": itin.get("source_file", ""),
                     "work_content": "",
@@ -125,6 +127,8 @@ class DataCorrelator:
                     "end_location": "",
                     "amount": inv_amount,
                     "has_invoice": True,
+                    "need_substitute": False,
+                    "car_type": "",
                     "source_file": invoice.get("source_file", ""),
                     "work_content": "",
                     "raw_text": invoice.get("raw_text", ""),
@@ -140,6 +144,8 @@ class DataCorrelator:
                     "end_location": itin.get("end_location", ""),
                     "amount": float(itin.get("amount", 0)),
                     "has_invoice": False,
+                    "need_substitute": itin.get("need_substitute", False),
+                    "car_type": itin.get("car_type", ""),
                     "source_file": itin.get("source_file", ""),
                     "work_content": "",
                     "raw_text": itin.get("raw_text", ""),
@@ -399,60 +405,168 @@ class DataCorrelator:
         records: List[Dict],
         work_description: str,
         work_match_prompt: str = "",
+        batch_size: int = 20,
     ) -> List[Dict]:
-        """为每条记录匹配工作内容"""
-        try:
-            import dashscope
-            from dashscope import Generation
-
-            dashscope.api_key = self.api_key
-
-            record_summary = []
-            for i, r in enumerate(records):
-                summary = (
-                    f"{i + 1}. 日期:{r.get('date', '')} "
-                    f"类型:{r.get('type', '')} "
-                    f"地点:{r.get('start_location', '')}-{r.get('end_location', '')} "
-                    f"酒店:{r.get('hotel_name', '')}"
-                )
-                record_summary.append(summary)
-
-            if work_match_prompt:
-                prompt = work_match_prompt.format(
-                    work_description=work_description,
-                    record_summary=chr(10).join(record_summary),
-                )
-            else:
-                from config import load_prompt
-                template = load_prompt("work_match")
-                prompt = template.format(
-                    work_description=work_description,
-                    record_summary=chr(10).join(record_summary),
-                )
-
-            response = Generation.call(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                result_format="message",
-            )
-
-            if response.status_code == 200:
-                content = response.output.choices[0].message.content
-                matches = self._extract_json(content)
-                if isinstance(matches, list):
-                    for m in matches:
-                        idx = m.get("index", 0) - 1
-                        if 0 <= idx < len(records):
-                            records[idx]["work_content"] = m.get("work_content", "")
-
-        except Exception as e:
-            print(f"匹配工作内容失败: {e}")
-
+        """为每条记录匹配工作内容（规则优先，AI作为增强）"""
+        # 先初始化所有记录的work_content为空
         for r in records:
-            if "work_content" not in r:
-                r["work_content"] = ""
+            r["work_content"] = ""
+
+        if not work_description:
+            return records
+
+        # 第1优先：规则匹配（零AI调用，始终可用）
+        self._match_work_content_rules(records, work_description)
+
+        # 第2优先：AI增强（如果有有效API Key）
+        try:
+            self._match_work_content_ai(records, work_description, work_match_prompt, batch_size)
+        except Exception:
+            pass  # AI失败不影响，规则匹配已完成
 
         return records
+
+    def _match_work_content_rules(
+        self, records: List[Dict], work_description: str
+    ):
+        """基于规则的工作内容匹配（无需AI）"""
+        import re
+
+        # 解析工作内容描述，提取 城市→工作内容 映射
+        # 支持分隔符：、，, \n
+        items = re.split(r'[、，,\n]+', work_description)
+        city_contents: Dict[str, List[str]] = {}  # {城市简称: [工作内容列表]}
+
+        for item in items:
+            item = item.strip()
+            if not item:
+                continue
+            # 查找已知城市关键词
+            known_cities = ['衢州', '桐庐', '浦江', '临安', '建德', '淳安']
+            for city in known_cities:
+                if city in item:
+                    city_contents.setdefault(city, []).append(item)
+                    break
+            else:
+                # 未知城市，保存为通用
+                city_contents.setdefault('_other', []).append(item)
+
+        if not city_contents:
+            return
+
+        # 按日期排序记录（便于分配同一城市的多个工作内容）
+        dated_records = [(r, r.get('date', '')) for r in records if r.get('date')]
+        dated_records.sort(key=lambda x: x[1])
+
+        # 为每条记录匹配工作内容
+        city_used: Dict[str, int] = {}  # 记录每个城市已使用到第几个工作内容
+        day_content_cache: Dict[str, str] = {}  # 同一天同一城市用同一个工作内容
+
+        for r, date in dated_records:
+            # 确定记录属于哪个城市
+            start = r.get('start_location', '')
+            end = r.get('end_location', '')
+            hotel = r.get('hotel_name', '')
+            all_text = f"{start} {end} {hotel}"
+
+            matched_city = None
+            for city in city_contents:
+                if city == '_other':
+                    continue
+                if city in all_text:
+                    matched_city = city
+                    break
+
+            if matched_city and matched_city in city_contents:
+                contents = city_contents[matched_city]
+                # 同一天的多条记录用同一个工作内容
+                day_key = f"{matched_city}_{date}"
+                if day_key in day_content_cache:
+                    r['work_content'] = day_content_cache[day_key]
+                else:
+                    # 分配下一个未使用的工作内容
+                    used_idx = city_used.get(matched_city, 0)
+                    if used_idx < len(contents):
+                        r['work_content'] = contents[used_idx]
+                        city_used[matched_city] = used_idx + 1
+                    elif contents:
+                        # 所有内容已分配完，用最后一个
+                        r['work_content'] = contents[-1]
+                    day_content_cache[day_key] = r.get('work_content', '')
+            elif '_other' in city_contents:
+                r['work_content'] = city_contents['_other'][0]
+
+    def _match_work_content_ai(
+        self,
+        records: List[Dict],
+        work_description: str,
+        work_match_prompt: str = "",
+        batch_size: int = 20,
+    ):
+        """AI增强工作内容匹配（可选，需要有效API Key）"""
+        # 分批处理
+        for batch_start in range(0, len(records), batch_size):
+            batch = records[batch_start:batch_start + batch_size]
+            try:
+                self._match_work_content_batch(
+                    batch, batch_start, work_description, work_match_prompt
+                )
+            except Exception as e:
+                print(f"AI工作内容匹配失败（批次 {batch_start}-{batch_start + len(batch)}）: {e}")
+
+    def _match_work_content_batch(
+        self,
+        batch: List[Dict],
+        batch_start: int,
+        work_description: str,
+        work_match_prompt: str = "",
+    ):
+        """处理一批记录的工作内容匹配"""
+        import dashscope
+        from dashscope import Generation
+
+        dashscope.api_key = self.api_key
+
+        record_summary = []
+        for i, r in enumerate(batch):
+            summary = (
+                f"{i + 1}. 日期:{r.get('date', '')} "
+                f"类型:{r.get('type', '')} "
+                f"地点:{r.get('start_location', '')}-{r.get('end_location', '')} "
+                f"酒店:{r.get('hotel_name', '')}"
+            )
+            record_summary.append(summary)
+
+        if work_match_prompt:
+            prompt = work_match_prompt.format(
+                work_description=work_description,
+                record_summary=chr(10).join(record_summary),
+            )
+        else:
+            from config import load_prompt
+            template = load_prompt("work_match")
+            prompt = template.format(
+                work_description=work_description,
+                record_summary=chr(10).join(record_summary),
+            )
+
+        response = Generation.call(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            result_format="message",
+        )
+
+        if response.status_code == 200:
+            content = response.output.choices[0].message.content
+            matches = self._extract_json(content)
+            if isinstance(matches, list):
+                for m in matches:
+                    # index是批次内的序号（从1开始），转为全局索引
+                    local_idx = m.get("index", 0) - 1
+                    if 0 <= local_idx < len(batch):
+                        batch[local_idx]["work_content"] = m.get("work_content", "")
+        else:
+            print(f"AI工作内容匹配API失败: {response.code} - {response.message}")
 
     def _extract_json(self, text: str) -> Optional[Dict]:
         """从文本中提取JSON"""

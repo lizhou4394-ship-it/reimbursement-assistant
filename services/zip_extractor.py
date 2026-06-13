@@ -54,17 +54,37 @@ class ZipExtractor:
                 }
 
                 if is_pdf(filename):
-                    # PDF转图片
+                    # PDF转图片 + 提取文字
                     file_info["images"] = self._pdf_to_images(filepath, filename)
+                    file_info["page_texts"] = self._extract_pdf_texts(filepath)
                 else:
                     # 图片直接使用
                     file_info["images"] = [filepath]
+                    file_info["page_texts"] = []
 
                 self.extracted_files.append(file_info)
 
         # 按文件名排序
         self.extracted_files.sort(key=lambda x: x["filename"])
         return self.extracted_files
+
+    def _extract_pdf_texts(self, pdf_path: str) -> List[str]:
+        """
+        提取PDF每一页的文字内容（用于文本型PDF的精确解析）
+
+        Returns:
+            每页文字的列表，如 ["第1页文字", "第2页文字", ...]
+        """
+        texts = []
+        try:
+            doc = fitz.open(pdf_path)
+            for page in doc:
+                text = page.get_text("text").strip()
+                texts.append(text)
+            doc.close()
+        except Exception as e:
+            print(f"PDF文字提取失败: {pdf_path}, 错误: {e}")
+        return texts
 
     def _pdf_to_images(self, pdf_path: str, pdf_name: str) -> List[str]:
         """
@@ -85,7 +105,7 @@ class ZipExtractor:
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 # 高分辨率渲染
-                mat = fitz.Matrix(2, 2)  # 2x缩放
+                mat = fitz.Matrix(3, 3)  # 3x缩放，提高清晰度
                 pix = page.get_pixmap(matrix=mat)
 
                 # 保存图片

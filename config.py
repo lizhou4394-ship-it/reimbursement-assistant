@@ -35,8 +35,10 @@ SECTION_ORDER = [
 EXPENSE_SECTION_MAP = {
     "火车票": "城际交通",
     "打车": "城际交通",
+    "打车行程单": "城际交通",
     "飞机票": "城际交通",
     "酒店": "住宿费",
+    "餐饮": "其他费用",
     "出差补贴": "补贴",
     "通讯补贴": "补贴",
     "餐补": "补贴",
@@ -51,6 +53,9 @@ DEFAULT_PROMPT_PATH = os.path.join(
 INVOICE_PARSE_PROMPT_PATH = os.path.join(
     os.path.dirname(__file__), "prompts", "invoice_parse.txt"
 )
+INVOICE_PARSE_TEXT_PROMPT_PATH = os.path.join(
+    os.path.dirname(__file__), "prompts", "invoice_parse_text.txt"
+)
 HOTEL_INFER_PROMPT_PATH = os.path.join(
     os.path.dirname(__file__), "prompts", "hotel_infer.txt"
 )
@@ -61,6 +66,7 @@ WORK_MATCH_PROMPT_PATH = os.path.join(
 PROMPT_FILES = {
     "default_prompt": DEFAULT_PROMPT_PATH,
     "invoice_parse": INVOICE_PARSE_PROMPT_PATH,
+    "invoice_parse_text": INVOICE_PARSE_TEXT_PROMPT_PATH,
     "hotel_infer": HOTEL_INFER_PROMPT_PATH,
     "work_match": WORK_MATCH_PROMPT_PATH,
 }
@@ -68,6 +74,7 @@ PROMPT_FILES = {
 PROMPT_NAMES = {
     "default_prompt": "报销规则总提示词",
     "invoice_parse": "发票识别提示词（视觉AI）",
+    "invoice_parse_text": "发票识别提示词（文本解析）",
     "hotel_infer": "酒店日期推算提示词",
     "work_match": "工作内容匹配提示词",
 }
