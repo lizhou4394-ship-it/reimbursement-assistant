@@ -44,18 +44,34 @@ class InvoiceParser:
     def _try_parse_regex(self, text: str):
         """
         尝试用正则解析结构化PDF（零AI调用）
-        支持：滴滴行程单、火车票
+        支持：滴滴行程单、火车票、酒店、餐饮、快递、飞机票
         跳过：滴滴发票（行程单已包含全部信息）
         返回 None 表示无法正则解析，需回退AI
         """
+        result = None
+
         if '滴滴出行' in text and '行程单' in text:
-            return self._regex_didi_itinerary(text)
+            result = self._regex_didi_itinerary(text)
         elif '电子发票' in text and '旅客运输服务' in text:
-            # 滴滴电子发票无需解析，行程单已有全部信息
             return {'type': '_skip', 'reason': '滴滴发票无需解析'}
         elif '中国铁路' in text or ('车次' in text and '座位号' in text):
-            return self._regex_train_ticket(text)
-        return None
+            result = self._regex_train_ticket(text)
+        elif any(kw in text for kw in ['住宿', '酒店', '客房', '宾馆', '旅馆']):
+            result = self._regex_hotel(text)
+        elif any(kw in text for kw in ['电子客票', '航空', '机票', '航班', '登机牌']):
+            result = self._regex_flight(text)
+        elif any(kw in text for kw in ['餐饮', '餐厅', '饭店', '餐费', '酒楼', '火锅']):
+            result = self._regex_restaurant(text)
+        elif any(kw in text for kw in ['快递', '顺丰', '圆通', '中通', '韵达', '申通', '邮政', '极兔']):
+            result = self._regex_courier(text)
+
+        # 统一校验：不合格则返回None，回退AI
+        if result is not None and result.get('type') != '_skip':
+            if not self._validate_parsed_result(result):
+                print(f"⚠️ 正则校验不通过（{result.get('type')}），回退AI")
+                return None
+
+        return result
 
     def _regex_didi_itinerary(self, text: str):
         """正则解析滴滴出行行程单（全部行程）"""
@@ -332,6 +348,219 @@ class InvoiceParser:
             'has_invoice': True,
             'raw_text': text[:200],
         }
+
+    # ------------------------------------------------------------------
+    #  酒店发票正则解析
+    # ------------------------------------------------------------------
+    def _regex_hotel(self, text: str):
+        """正则解析酒店住宿发票"""
+        # 提取日期（开票日期，非入住日期）
+        date_str = self._extract_date(text)
+
+        # 提取酒店名称
+        hotel_name = ''
+        # 尝试从常见模式提取：XX酒店/XX宾馆/XX饭店
+        name_match = re.search(
+            r'([\u4e00-\u9fff]{2,15}(?:酒店|宾馆|饭店|旅馆|公寓|客栈|民宿|大厦|商务酒店))',
+            text,
+        )
+        if name_match:
+            hotel_name = name_match.group(1)
+
+        # 提取金额（价税合计）
+        amount = self._extract_amount(text)
+
+        # 提取住宿天数和单价（如有）
+        nights = ''
+        daily_rate = ''
+        nights_match = re.search(r'(\d+)\s*[晚天夜]', text)
+        if nights_match:
+            nights = int(nights_match.group(1))
+        rate_match = re.search(r'(?:单价|每日|日均)[^0-9]*([\d.]+)', text)
+        if rate_match:
+            daily_rate = float(rate_match.group(1))
+
+        if not amount:
+            return None
+
+        return {
+            'type': '酒店',
+            'date': date_str,
+            'start_location': '',
+            'end_location': '',
+            'amount': amount,
+            'hotel_name': hotel_name,
+            'nights': nights,
+            'daily_rate': daily_rate,
+            'has_invoice': True,
+            'raw_text': text[:200],
+        }
+
+    # ------------------------------------------------------------------
+    #  飞机票正则解析
+    # ------------------------------------------------------------------
+    def _regex_flight(self, text: str):
+        """正则解析飞机票/电子客票行程单"""
+        date_str = self._extract_date(text)
+
+        # 提取起降城市/机场
+        start_loc = ''
+        end_loc = ''
+        # 常见格式：出发城市-到达城市，或 起飞机场 到达机场
+        city_match = re.search(
+            r'([\u4e00-\u9fff]{2,6})\s*[-–—→~]\s*([\u4e00-\u9fff]{2,6})',
+            text,
+        )
+        if city_match:
+            start_loc = city_match.group(1)
+            end_loc = city_match.group(2)
+        else:
+            # 尝试从“始发”“到达”等字段提取
+            dep = re.search(r'(?:始发|出发|起飞)[^\u4e00-\u9fff]*([\u4e00-\u9fff]{2,6})', text)
+            arr = re.search(r'(?:到达|抵达|目的)[^\u4e00-\u9fff]*([\u4e00-\u9fff]{2,6})', text)
+            if dep and arr:
+                start_loc = dep.group(1)
+                end_loc = arr.group(1)
+
+        amount = self._extract_amount(text)
+
+        if not amount:
+            return None
+
+        return {
+            'type': '飞机票',
+            'date': date_str,
+            'start_location': start_loc,
+            'end_location': end_loc,
+            'amount': amount,
+            'hotel_name': '',
+            'nights': '',
+            'daily_rate': '',
+            'has_invoice': True,
+            'raw_text': text[:200],
+        }
+
+    # ------------------------------------------------------------------
+    #  餐饮发票正则解析
+    # ------------------------------------------------------------------
+    def _regex_restaurant(self, text: str):
+        """正则解析餐饮发票"""
+        date_str = self._extract_date(text)
+        amount = self._extract_amount(text)
+
+        if not amount:
+            return None
+
+        return {
+            'type': '餐饮',
+            'date': date_str,
+            'start_location': '',
+            'end_location': '',
+            'amount': amount,
+            'hotel_name': '',
+            'nights': '',
+            'daily_rate': '',
+            'has_invoice': True,
+            'raw_text': text[:200],
+        }
+
+    # ------------------------------------------------------------------
+    #  快递发票正则解析
+    # ------------------------------------------------------------------
+    def _regex_courier(self, text: str):
+        """正则解析快递发票"""
+        date_str = self._extract_date(text)
+        amount = self._extract_amount(text)
+
+        if not amount:
+            return None
+
+        return {
+            'type': '快递',
+            'date': date_str,
+            'start_location': '',
+            'end_location': '',
+            'amount': amount,
+            'hotel_name': '',
+            'nights': '',
+            'daily_rate': '',
+            'has_invoice': True,
+            'raw_text': text[:200],
+        }
+
+    # ------------------------------------------------------------------
+    #  通用提取辅助方法
+    # ------------------------------------------------------------------
+    def _extract_date(self, text: str) -> str:
+        """通用日期提取（返回YYYY-MM-DD格式）"""
+        # 优先匹配完整日期格式
+        dm = re.search(r'(\d{4})\D+(\d{1,2})\D+(\d{1,2})\D', text)
+        if dm:
+            return f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
+        # 回退：YYYY-MM-DD 格式
+        dm = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', text)
+        if dm:
+            return f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
+        return ''
+
+    def _extract_amount(self, text: str) -> float:
+        """通用金额提取（价税合计/合计金额）"""
+        # 优先匹配“价税合计”“合计”后的小写金额
+        patterns = [
+            r'(?:价税合计|合计金额|小写|价税合计\(小写\))[^0-9]*[¥￥]?\s*([\d,]+\.?\d*)',
+            r'[¥￥]\s*([\d,]+\.\d{2})',
+            r'(?:金额|总计|总额)[^0-9]*[¥￥]?\s*([\d,]+\.?\d*)',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                val = m.group(1).replace(',', '')
+                try:
+                    return round(float(val), 2)
+                except ValueError:
+                    continue
+        return 0
+
+    # ------------------------------------------------------------------
+    #  统一校验方法
+    # ------------------------------------------------------------------
+    def _validate_parsed_result(self, result: dict) -> bool:
+        """
+        校验正则解析结果的完整性和合理性
+        返回 False 表示校验不通过，需回退AI
+        """
+        inv_type = result.get('type', '')
+        amount = result.get('amount', 0)
+        date = result.get('date', '')
+
+        # 1. 金额必须大于0
+        if not amount or amount <= 0:
+            return False
+
+        # 2. 金额不能超过合理上限
+        MAX_AMOUNT = {'火车票': 2000, '飞机票': 5000, '酒店': 5000,
+                      '餐饮': 2000, '快递': 500, '打车': 500}
+        if amount > MAX_AMOUNT.get(inv_type, 10000):
+            return False
+
+        # 3. 日期必须存在且格式正确
+        if not date or not re.match(r'\d{4}-\d{2}-\d{2}$', date):
+            return False
+
+        # 4. 日期必须在合理范围内（2020-2030）
+        year = int(date[:4])
+        if year < 2020 or year > 2030:
+            return False
+
+        # 5. 类型特定校验
+        if inv_type == '火车票':
+            if not result.get('start_location') or not result.get('end_location'):
+                return False
+        elif inv_type == '飞机票':
+            if not result.get('start_location') or not result.get('end_location'):
+                return False
+
+        return True
 
     def _parse_with_text_model(self, page_text: str, invoice_parse_prompt: str = ""):
         """使用纯文本模型解析PDF提取的文字（更精确、不会遗漏）"""
