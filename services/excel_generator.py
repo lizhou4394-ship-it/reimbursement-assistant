@@ -202,8 +202,8 @@ class ExcelGenerator:
             except ValueError:
                 continue
 
-            # 滴滴行程单：打车地点中出现的每个城市都算
-            if inv_type == "打车行程单":
+            # 滴滴行程单/打车发票：打车地点中出现的每个城市都算
+            if inv_type in ("打车行程单", "打车"):
                 found_city = False
                 for loc_key in ("start_location", "end_location"):
                     loc = inv.get(loc_key, "")
