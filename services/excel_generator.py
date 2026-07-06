@@ -1,7 +1,7 @@
 """Excel报销单生成服务 - 严格按照模板格式生成"""
 import io
 from typing import List, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
@@ -176,134 +176,107 @@ class ExcelGenerator:
         self, invoices: List[Dict], home_city: str = "杭州"
     ) -> Dict:
         """
-        计算出差天数
+        计算出差天数（多城市独立日期算法）
 
-        策略：按目的地分组，贪心配对出发↔返回，直接求和
-        - 当天往返=1天，跨天=end-start+1
-        - 外地中转票(X→Y)算作X的出发日
-        - 同一目的地多次出差取sum累加
-        - 利用打车行程单补充缺失的出发/返回记录
+        核心思路：
+        1. 每个城市独立收集“人在该城市”的日期证据
+        2. 滴滴打车、火车到达、火车出发都算证据
+        3. 过渡日可同时属于多个城市（如温州出发去永康，06-10同时算温州和永康）
+        4. 连续日期分段，间隔≥3天视为新出差
+        5. 每段天数 = 最后一天 - 第一天 + 1
 
         Returns:
-            {地区简称: 天数}  例如 {"桐庐": 2, "衢州": 7}
+            {地区简称: 天数}  例如 {"温州": 5, "桐庐": 3}
         """
-        travel_days: Dict[str, int] = {}
-        dest_departs: Dict[str, List] = {}  # {目的地: [date, ...]}
-        dest_returns: Dict[str, List] = {}  # {目的地: [date, ...]}
+        # ====== 第一步：收集每日城市证据 ======
+        date_cities: Dict = {}  # {date: {city1, city2, ...}}
+        date_no_city: Dict = {}  # {date: [inv, ...]} 无城市提取的滴滴记录
 
-        # 先从火车/飞机票提取出发返回记录
         for inv in invoices:
             inv_type = inv.get("type", "")
             date_str = inv.get("date", "")
             if not date_str:
                 continue
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
 
-            if inv_type in ("火车票", "飞机票"):
+            # 滴滴行程单：打车地点中出现的每个城市都算
+            if inv_type == "打车行程单":
+                found_city = False
+                for loc_key in ("start_location", "end_location"):
+                    loc = inv.get(loc_key, "")
+                    city = self._extract_city_from_location(loc)
+                    if city and city != home_city and len(city) >= 2:
+                        date_cities.setdefault(d, set()).add(city)
+                        found_city = True
+                if not found_city:
+                    date_no_city.setdefault(d, []).append(inv)
+
+            # 火车票/飞机票：出发城市和到达城市都算
+            elif inv_type in ("火车票", "飞机票"):
                 start = inv.get("start_location", "")
                 end = inv.get("end_location", "")
                 start_city = self._extract_city(start)
                 end_city = self._extract_city(end)
 
-                if home_city in start and home_city not in end:
-                    # 从家出发去外地
-                    dest_departs.setdefault(end_city, []).append(
-                        datetime.strptime(date_str, "%Y-%m-%d").date()
-                    )
-                elif home_city in end and home_city not in start:
-                    # 从外地回家
-                    dest_returns.setdefault(start_city, []).append(
-                        datetime.strptime(date_str, "%Y-%m-%d").date()
-                    )
-                elif home_city not in start and home_city not in end:
-                    # 城际交通：从A城市去B城市，算作离开A城市
-                    if start_city and end_city and start_city != end_city:
-                        dest_departs.setdefault(start_city, []).append(
-                            datetime.strptime(date_str, "%Y-%m-%d").date()
-                        )
+                if end_city and end_city != home_city:
+                    date_cities.setdefault(d, set()).add(end_city)
+                if start_city and start_city != home_city:
+                    date_cities.setdefault(d, set()).add(start_city)
 
-        # 从打车行程单补充缺失的出发记录
-        # 如果在某城市有打车记录但没有出发火车票，用最早打车日期作为出发日期
-        taxi_city_dates: Dict[str, List] = {}  # {城市: [date, ...]}
-        for inv in invoices:
-            if inv.get("type") != "打车行程单":
-                continue
-            date_str = inv.get("date", "")
-            if not date_str:
-                continue
-            # 从起点/终点提取城市
-            for loc_key in ("start_location", "end_location"):
-                loc = inv.get(loc_key, "")
-                city = self._extract_city_from_location(loc)
-                if city and city != home_city and len(city) >= 2:
-                    try:
-                        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        taxi_city_dates.setdefault(city, []).append(d)
-                    except ValueError:
-                        pass
+        # ====== 第二步：城市继承（填补滴滴地点不含城市名的缺口） ======
+        # 2a. 同一天内：有城市的滴滴记录传染给无城市的记录
+        for d, invs in date_no_city.items():
+            known = date_cities.get(d, set())
+            if known:
+                for city in known:
+                    date_cities.setdefault(d, set()).add(city)
 
-        # 对有返回记录但无出发记录的城市，用打车日期补充
-        all_return_cities = set(dest_returns.keys())
-        all_depart_cities = set(dest_departs.keys())
-        missing_depart = all_return_cities - all_depart_cities
-        for city in missing_depart:
-            # 查找该城市的返回日期
-            city_returns = sorted(dest_returns.get(city, []))
-            if not city_returns:
-                continue
-            # 在打车记录中找到返回日期之前且最接近返回日期的记录
-            earliest_taxi = None
-            for taxi_city, dates in taxi_city_dates.items():
-                if city in taxi_city or taxi_city in city:
-                    for d in sorted(dates):
-                        # 取返回日期之前、且不超过7天范围的最早日期
-                        if d <= city_returns[0]:
-                            if (city_returns[0] - d).days <= 7:
-                                if earliest_taxi is None or d < earliest_taxi:
-                                    earliest_taxi = d
-            if earliest_taxi:
-                dest_departs.setdefault(city, []).append(earliest_taxi)
+        # 2b. 相邻日期继承：如果某天的滴滴记录无城市，但前后1天有已知非家乡城市，则继承
+        all_dates = sorted(set(list(date_cities.keys()) + list(date_no_city.keys())))
+        for d in all_dates:
+            if d in date_no_city and d not in date_cities:
+                # 尝试从前1天继承
+                prev_d = d - timedelta(days=1)
+                if prev_d in date_cities:
+                    for city in date_cities[prev_d]:
+                        date_cities.setdefault(d, set()).add(city)
+                    continue
+                # 尝试从后1天继承
+                next_d = d + timedelta(days=1)
+                if next_d in date_cities:
+                    for city in date_cities[next_d]:
+                        date_cities.setdefault(d, set()).add(city)
 
-        # 对有打车记录但无出发/返回记录的城市，也尝试补充
-        for city, dates in taxi_city_dates.items():
-            if city not in dest_departs and city not in dest_returns:
-                # 只在有火车返回票匹配时才补充
-                for ret_city in all_return_cities:
-                    if city in ret_city or ret_city in city:
-                        earliest = min(dates)
-                        dest_departs.setdefault(city, []).append(earliest)
-                        break
+        # ====== 第三步：每个城市独立计算出差天数 ======
+        city_dates: Dict[str, set] = {}  # 翻转: {city: {date, ...}}
+        for d, cities in date_cities.items():
+            for city in cities:
+                city_dates.setdefault(city, set()).add(d)
 
-        # 按目的地计算出差天数
-        for dest in set(list(dest_departs.keys()) + list(dest_returns.keys())):
-            departs = sorted(set(dest_departs.get(dest, [])))  # 出发去重
-            returns = sorted(dest_returns.get(dest, []))       # 返回不去重（重复票保留）
-
-            if not departs:
+        # 每个城市独立计算出差天数
+        travel_days: Dict[str, int] = {}
+        for city, dates in city_dates.items():
+            sorted_dates = sorted(dates)
+            if not sorted_dates:
                 continue
 
-            # 贪心配对：每个出发找最早的未使用返回
-            used = set()
-            segments = []
-            for dep_date in departs:
-                best = None
-                for j, ret_date in enumerate(returns):
-                    if j not in used and ret_date >= dep_date:
-                        best = (dep_date, ret_date, j)
-                        break
-                if best:
-                    segments.append([best[0], best[1]])
-                    used.add(best[2])
-                else:
-                    segments.append([dep_date, dep_date])  # 无返回，按当天往返
+            # 按间隔≥3天分段（允许1-2天证据缺口被吸收）
+            total = 0
+            seg_start = sorted_dates[0]
+            prev = sorted_dates[0]
+            for d in sorted_dates[1:]:
+                gap = (d - prev).days
+                if gap >= 3:
+                    total += (prev - seg_start).days + 1
+                    seg_start = d
+                prev = d
+            total += (prev - seg_start).days + 1
+            travel_days[city] = total
 
-            # 直接求和：当天往返=1天，跨天=end-start+1
-            total = sum(
-                1 if seg[0] == seg[1] else (seg[1] - seg[0]).days + 1
-                for seg in segments
-            )
-            travel_days[dest] = max(travel_days.get(dest, 0), total)
-
-        # 酒店也参与天数补充
+        # 酒店发票补充
         for inv in invoices:
             if inv.get("type") == "酒店":
                 check_in = inv.get("check_in_date", "")
@@ -313,11 +286,12 @@ class ExcelGenerator:
                         d_in = datetime.strptime(check_in, "%Y-%m-%d").date()
                         d_out = datetime.strptime(check_out, "%Y-%m-%d").date()
                         nights = (d_out - d_in).days
-                        hotel_city = self._infer_hotel_city(inv, invoices)
-                        if hotel_city:
-                            travel_days[hotel_city] = max(
-                                travel_days.get(hotel_city, 0), nights
-                            )
+                        if nights > 0:
+                            hotel_city = self._infer_hotel_city(inv, invoices)
+                            if hotel_city:
+                                travel_days[hotel_city] = max(
+                                    travel_days.get(hotel_city, 0), nights
+                                )
                     except ValueError:
                         pass
 
