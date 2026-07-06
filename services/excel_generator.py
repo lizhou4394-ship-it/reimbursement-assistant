@@ -182,6 +182,7 @@ class ExcelGenerator:
         - 当天往返=1天，跨天=end-start+1
         - 外地中转票(X→Y)算作X的出发日
         - 同一目的地多次出差取sum累加
+        - 利用打车行程单补充缺失的出发/返回记录
 
         Returns:
             {地区简称: 天数}  例如 {"桐庐": 2, "衢州": 7}
@@ -190,6 +191,7 @@ class ExcelGenerator:
         dest_departs: Dict[str, List] = {}  # {目的地: [date, ...]}
         dest_returns: Dict[str, List] = {}  # {目的地: [date, ...]}
 
+        # 先从火车/飞机票提取出发返回记录
         for inv in invoices:
             inv_type = inv.get("type", "")
             date_str = inv.get("date", "")
@@ -218,6 +220,58 @@ class ExcelGenerator:
                         dest_departs.setdefault(start_city, []).append(
                             datetime.strptime(date_str, "%Y-%m-%d").date()
                         )
+
+        # 从打车行程单补充缺失的出发记录
+        # 如果在某城市有打车记录但没有出发火车票，用最早打车日期作为出发日期
+        taxi_city_dates: Dict[str, List] = {}  # {城市: [date, ...]}
+        for inv in invoices:
+            if inv.get("type") != "打车行程单":
+                continue
+            date_str = inv.get("date", "")
+            if not date_str:
+                continue
+            # 从起点/终点提取城市
+            for loc_key in ("start_location", "end_location"):
+                loc = inv.get(loc_key, "")
+                city = self._extract_city_from_location(loc)
+                if city and city != home_city and len(city) >= 2:
+                    try:
+                        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        taxi_city_dates.setdefault(city, []).append(d)
+                    except ValueError:
+                        pass
+
+        # 对有返回记录但无出发记录的城市，用打车日期补充
+        all_return_cities = set(dest_returns.keys())
+        all_depart_cities = set(dest_departs.keys())
+        missing_depart = all_return_cities - all_depart_cities
+        for city in missing_depart:
+            # 查找该城市的返回日期
+            city_returns = sorted(dest_returns.get(city, []))
+            if not city_returns:
+                continue
+            # 在打车记录中找到返回日期之前且最接近返回日期的记录
+            earliest_taxi = None
+            for taxi_city, dates in taxi_city_dates.items():
+                if city in taxi_city or taxi_city in city:
+                    for d in sorted(dates):
+                        # 取返回日期之前、且不超过7天范围的最早日期
+                        if d <= city_returns[0]:
+                            if (city_returns[0] - d).days <= 7:
+                                if earliest_taxi is None or d < earliest_taxi:
+                                    earliest_taxi = d
+            if earliest_taxi:
+                dest_departs.setdefault(city, []).append(earliest_taxi)
+
+        # 对有打车记录但无出发/返回记录的城市，也尝试补充
+        for city, dates in taxi_city_dates.items():
+            if city not in dest_departs and city not in dest_returns:
+                # 只在有火车返回票匹配时才补充
+                for ret_city in all_return_cities:
+                    if city in ret_city or ret_city in city:
+                        earliest = min(dates)
+                        dest_departs.setdefault(city, []).append(earliest)
+                        break
 
         # 按目的地计算出差天数
         for dest in set(list(dest_departs.keys()) + list(dest_returns.keys())):
@@ -367,6 +421,26 @@ class ExcelGenerator:
             if location.endswith(suffix) and len(location) > len(suffix):
                 return location[: -len(suffix)]
         return location
+
+    @staticmethod
+    def _extract_city_from_location(location: str) -> str:
+        """从打车地点字符串中提取城市名（如 '温州北站-网约车上车点' -> '温州'）"""
+        if not location:
+            return ""
+        import re
+        # 匹配已知城市名（在打车地点字符串中）
+        known_cities = [
+            '杭州', '温州', '金华', '衢州', '桐庐', '永康', '横店', '浦江',
+            '义乌', '宁波', '绍兴', '嘉兴', '湖州', '台州', '丽水', '舟山',
+        ]
+        for city in known_cities:
+            if city in location:
+                return city
+        # 匹配 "XX市" 或 "XX站" 或 "XX区" 格式
+        m = re.search(r'([\u4e00-\u9fff]{2,4})(?:市|站|区|县)', location)
+        if m:
+            return m.group(1)
+        return ""
 
     def _infer_hotel_city(self, hotel: Dict, all_invoices: List[Dict]) -> str:
         """根据酒店名称和打车记录推断所在城市"""

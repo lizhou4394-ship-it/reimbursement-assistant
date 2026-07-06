@@ -66,10 +66,17 @@ class InvoiceParser:
             result = self._regex_courier(text)
 
         # 统一校验：不合格则返回None，回退AI
-        if result is not None and result.get('type') != '_skip':
-            if not self._validate_parsed_result(result):
-                print(f"⚠️ 正则校验不通过（{result.get('type')}），回退AI")
-                return None
+        if result is not None:
+            if isinstance(result, list):
+                # 列表结果（如行程单），逐条校验
+                for item in result:
+                    if not self._validate_parsed_result(item):
+                        print(f"⚠️ 正则校验不通过（行程单某条记录），回退AI")
+                        return None
+            elif result.get('type') != '_skip':
+                if not self._validate_parsed_result(result):
+                    print(f"⚠️ 正则校验不通过（{result.get('type')}），回退AI")
+                    return None
 
         return result
 
@@ -114,7 +121,12 @@ class InvoiceParser:
         locations = []
         for i in range(1, len(segments)):
             seg = segments[i]
-            seg = re.sub(r'^[\s\n]*[\u4e00-\u9fff]{1,4}[\s\n]*市[\s\n]*', '', seg)
+            # 去掉残余的周几字符（如 split 没完全匹配到的 周一/周二 第二字）
+            seg = re.sub(r'^[\s\n]*[一二三四五六日][\s\n]*', '', seg)
+            # 去掉城市名前缀（城市名可能独占一行，"市"在下一行）
+            seg = re.sub(r'^[\s\n]*[\u4e00-\u9fff]{1,4}\n市\n', '', seg)
+            seg = re.sub(r'^[\s\n]*[\u4e00-\u9fff]{1,4}市[\s\n]*', '', seg)
+            seg = re.sub(r'^[\s\n]*市[\s\n]*', '', seg)
             seg = re.sub(r'\n\d+\.?\d*\n\d+\.\d{2}.*$', '', seg, flags=re.DOTALL)
             parts = seg.strip().split('\n')
             parts = [p.strip() for p in parts if p.strip()]
@@ -361,7 +373,7 @@ class InvoiceParser:
         hotel_name = ''
         # 尝试从常见模式提取：XX酒店/XX宾馆/XX饭店
         name_match = re.search(
-            r'([\u4e00-\u9fff]{2,15}(?:酒店|宾馆|饭店|旅馆|公寓|客栈|民宿|大厦|商务酒店))',
+            r'([\u4e00-\u9fff]{2,15}(?:酒店|宾馆|饭店|旅馆|公寓|客栈|民宿|大厦|住宿|商务酒店))',
             text,
         )
         if name_match:
