@@ -424,22 +424,45 @@ class ExcelGenerator:
 
     @staticmethod
     def _extract_city_from_location(location: str) -> str:
-        """从打车地点字符串中提取城市名（如 '温州北站-网约车上车点' -> '温州'）"""
+        """
+        从打车地点字符串中提取城市名（无硬编码列表）
+        支持格式：
+        - "温州北站-网约车上车点" -> "温州"
+        - "金华市车站路" -> "金华"
+        - "桐庐县桐君街道" -> "桐庐"
+        - "瓯海区|温州南站" -> "瓯海"
+        """
         if not location:
             return ""
         import re
-        # 匹配已知城市名（在打车地点字符串中）
-        known_cities = [
-            '杭州', '温州', '金华', '衢州', '桐庐', '永康', '横店', '浦江',
-            '义乌', '宁波', '绍兴', '嘉兴', '湖州', '台州', '丽水', '舟山',
-        ]
-        for city in known_cities:
-            if city in location:
-                return city
-        # 匹配 "XX市" 或 "XX站" 或 "XX区" 格式
-        m = re.search(r'([\u4e00-\u9fff]{2,4})(?:市|站|区|县)', location)
+        # 匹配 "XX市" 格式（最可靠）
+        m = re.search(r'([\u4e00-\u9fff]{2,4})市', location)
         if m:
             return m.group(1)
+        # 匹配 "XX站" 格式（火车站名，去掉后缀提取城市）
+        m = re.search(r'([\u4e00-\u9fff]{2,6})(?:西站|东站|南站|北站)', location)
+        if m:
+            return m.group(1)
+        # 匹配 "XX区" 或 "XX县" 格式
+        m = re.search(r'([\u4e00-\u9fff]{2,4})(?:区|县)', location)
+        if m:
+            return m.group(1)
+        # 从括号中提取城市（如"全季酒店(温州车站大道店)" -> "温州"）
+        m = re.search(r'[\(\uff08]([^\)\uff09]*?)[\)\uff09]', location)
+        if m:
+            inner = m.group(1)
+            # 括号内容中查找“XX市/区/县”格式
+            cm = re.search(r'([\u4e00-\u9fff]{2,4})(?:市|区|县)', inner)
+            if cm:
+                return cm.group(1)
+            # 括号内容中查找“XX站”格式（排除“车站”“站台”等常见词）
+            cm = re.search(r'([\u4e00-\u9fff]{2,6})(?:西站|东站|南站|北站|(?<!车)站)', inner)
+            if cm:
+                return cm.group(1)
+            # 取括号内前2个中文字符（中国城市名通常为2字）
+            cm = re.match(r'([\u4e00-\u9fff]{2})(?=[\u4e00-\u9fff])', inner)
+            if cm:
+                return cm.group(1)
         return ""
 
     def _infer_hotel_city(self, hotel: Dict, all_invoices: List[Dict]) -> str:

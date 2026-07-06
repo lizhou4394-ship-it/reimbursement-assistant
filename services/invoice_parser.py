@@ -253,91 +253,9 @@ class InvoiceParser:
         date_str = travel_date or ''
 
         # 提取出发站和到达站
-        # 用拼音站名确定方向（拼音总是按列车运行方向排列）
-        # 匹配任何3+字母大写词（覆盖 Pujiang/Quzhou 等无后缀站名）
-        PINYIN_MAP = {
-            'Hangzhouxi': '杭州西', 'Hangzhoudong': '杭州东',
-            'Hangzhounan': '杭州南', 'Hangzhoubei': '杭州北',
-            'Hangzhouzhan': '杭州站', 'Hangzhou': '杭州',
-            'Tongludong': '桐庐东', 'Tonglu': '桐庐',
-            'Quzhouxi': '衢州西', 'Quzhoudong': '衢州东',
-            'Quzhou': '衢州', 'Quzhouzhan': '衢州站',
-            'Pujiang': '浦江', 'Pujiangzhan': '浦江站',
-        }
-        NOISE = {'Mai', 'Shi', 'Hangzhouxingchen', 'Xingchen', 'Shengwu',
-                 'Jishu', 'Youxian', 'Gongsi', 'Zhejiang', 'Zhongguo',
-                 'Tielu', 'Dianzi', 'Faipioa', 'Keji', 'Sheng', 'Shi'}
-        pinyin = re.findall(r'([A-Z][a-z]{2,})', text)
-        pinyin = [p for p in pinyin if p in PINYIN_MAP or p not in NOISE]
-
-        start_loc = ''
-        end_loc = ''
-        if len(pinyin) >= 2:
-            p1 = PINYIN_MAP.get(pinyin[0], '')
-            p2 = PINYIN_MAP.get(pinyin[1], '')
-            if p1 and p2:
-                # 检查两个拼音之间是否有第三个站名（被省略的出发站）
-                idx1 = text.find(pinyin[0])
-                idx2 = text.find(pinyin[1])
-                if idx1 >= 0 and idx2 > idx1:
-                    between = text[idx1 + len(pinyin[0]):idx2]
-                    # 找中文站名 + 站/东/西/南/北
-                    hidden = re.findall(
-                        r'([\u4e00-\u9fff]{2,6})(?:站|\u4e1c|\u897f|\u5357|\u5317)',
-                        between,
-                    )
-                    if hidden:
-                        # 隐藏站是实际出发站，第一个拼音是到达站
-                        start_loc = hidden[0]
-                        end_loc = p2
-                    else:
-                        start_loc = p1
-                        end_loc = p2
-
-        # 回退：只有1个拼音时，搜索已知中文站名
-        if not start_loc or not end_loc:
-            known_stations = [
-                '杭州西站', '杭州东站', '杭州南站', '杭州北站', '杭州站',
-                '桐庐东站', '桐庐站', '衢州西站', '衢州东站', '衢州站',
-                '浦江站',
-            ]
-            found_stations = []
-            for st in known_stations:
-                if st in text:
-                    found_stations.append(st)
-            if pinyin and len(found_stations) >= 1:
-                p_loc = PINYIN_MAP.get(pinyin[0], '')
-                if p_loc:
-                    # 判断拼音站和中文站的出发/到达关系
-                    is_known = any(p_loc in st or st.startswith(p_loc) for st in found_stations)
-                    if is_known:
-                        # 拼音站就是中文站之一，找另一个
-                        other = [st for st in found_stations if p_loc not in st and not st.startswith(p_loc)]
-                        if other:
-                            # 按文本位置排序确定方向
-                            pos_p = text.find(pinyin[0])
-                            pos_o = text.find(other[0])
-                            if pos_p < pos_o:
-                                start_loc = p_loc
-                                end_loc = other[0].rstrip('站')
-                            else:
-                                start_loc = other[0].rstrip('站')
-                                end_loc = p_loc
-                    else:
-                        start_loc = p_loc
-                        end_loc = found_stations[0].rstrip('站')
-            elif len(found_stations) >= 2:
-                start_loc = found_stations[0].rstrip('站')
-                end_loc = found_stations[1].rstrip('站')
-
-        # 最后回退：纯中文站名
-        if not start_loc or not end_loc:
-            stations = re.findall(
-                r'([\u4e00-\u9fff]{2,6})(?:站|\u4e1c|\u897f|\u5357|\u5317)', text
-            )
-            if len(stations) >= 2:
-                start_loc = stations[0]
-                end_loc = stations[1]
+        # 策略：直接提取中文站名（XX站格式），适用于全国所有火车站
+        # 火车票中同时包含中文站名和拼音站名，中文站名总是可用的
+        start_loc, end_loc = self._extract_train_stations(text)
 
         # 提取金额
         amt = re.search(r'[¥￥]\s*([\d.]+)', text)
@@ -360,6 +278,36 @@ class InvoiceParser:
             'has_invoice': True,
             'raw_text': text[:200],
         }
+
+    @staticmethod
+    def _extract_train_stations(text: str):
+        """
+        从火车票文本中提取出发站和到达站（纯中文站名，无需拼音映射）
+
+        火车票电子发票中总是同时包含中文站名和拼音站名，
+        直接提取中文站名即可覆盖全国所有火车站。
+        """
+        import re as _re
+        # 提取所有“XX站”格式的中文站名（2-6个中文字符 + 站）
+        raw_stations = _re.findall(r'([\u4e00-\u9fff]{2,6})站', text)
+
+        # 排除非站名的干扰词
+        NOISE_WORDS = {
+            '购买方名', '销售方名', '开票人', '购买方', '销售方',
+            '统一社会', '代码', '旅客运输', '电子发票',
+        }
+        stations = []
+        seen = set()
+        for s in raw_stations:
+            if s not in seen and not any(n in s for n in NOISE_WORDS):
+                stations.append(s)
+                seen.add(s)
+
+        # 取前两个站名作为出发站和到达站
+        start_loc = stations[0] if len(stations) >= 1 else ''
+        end_loc = stations[1] if len(stations) >= 2 else ''
+
+        return start_loc, end_loc
 
     # ------------------------------------------------------------------
     #  酒店发票正则解析

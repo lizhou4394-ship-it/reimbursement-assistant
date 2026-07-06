@@ -435,21 +435,39 @@ class DataCorrelator:
         # 解析工作内容描述，提取 城市→工作内容 映射
         # 支持分隔符：、，, \n
         items = re.split(r'[、，,\n]+', work_description)
-        city_contents: Dict[str, List[str]] = {}  # {城市简称: [工作内容列表]}
 
+        # 从票据记录中动态提取所有出现的城市名（不用硬编码）
+        all_cities = set()
+        for r in records:
+            for loc_key in ('start_location', 'end_location', 'hotel_name'):
+                loc = r.get(loc_key, '')
+                if loc:
+                    # 从站点名中提取城市（去掉站名后缀）
+                    city = self._extract_city_from_text(loc)
+                    if city and len(city) >= 2:
+                        all_cities.add(city)
+
+        # 解析工作描述，将每条内容与匹配的城市关联
+        city_contents: Dict[str, List[str]] = {}
         for item in items:
             item = item.strip()
             if not item:
                 continue
-            # 查找已知城市关键词
-            known_cities = ['衢州', '桐庐', '浦江', '临安', '建德', '淳安']
-            for city in known_cities:
+            # 在工作描述中查找票据中出现的城市名
+            matched = False
+            for city in sorted(all_cities, key=len, reverse=True):  # 优先匹配长城市名
                 if city in item:
                     city_contents.setdefault(city, []).append(item)
+                    matched = True
                     break
-            else:
-                # 未知城市，保存为通用
-                city_contents.setdefault('_other', []).append(item)
+            if not matched:
+                # 尝试从工作描述中提取“城市:”或“城市-”格式
+                prefix_match = re.match(r'^([\u4e00-\u9fff]{2,4})[:：\-—]', item)
+                if prefix_match:
+                    city = prefix_match.group(1)
+                    city_contents.setdefault(city, []).append(item)
+                else:
+                    city_contents.setdefault('_other', []).append(item)
 
         if not city_contents:
             return
@@ -495,6 +513,40 @@ class DataCorrelator:
                     day_content_cache[day_key] = r.get('work_content', '')
             elif '_other' in city_contents:
                 r['work_content'] = city_contents['_other'][0]
+
+    @staticmethod
+    def _extract_city_from_text(text: str) -> str:
+        """
+        从地点文本中提取城市名（通用，无硬编码列表）
+        支持多种格式：
+        - 火车站: "杭州西站" -> "杭州", "桐庐东" -> "桐庐"
+        - 打车地点: "温州北站-网约车上车点" -> "温州"
+        - 酒店名: "全季酒店(温州车站大道店)" -> "温州"
+        """
+        import re as _re
+        if not text:
+            return ''
+        # 去掉站名后缀提取城市
+        for suffix in ('西站', '东站', '南站', '北站', '站', '东', '西', '南', '北'):
+            if text.endswith(suffix) and len(text) > len(suffix):
+                return text[:-len(suffix)]
+        # 匹配“XX市”或“XX区”格式
+        m = _re.search(r'([\u4e00-\u9fff]{2,4})(?:市|区|县)', text)
+        if m:
+            return m.group(1)
+        # 从括号中提取城市（如“全季酒店(温州车站大道店)”）
+        m = _re.search(r'[\(\uff08]([^\)\uff09]*?)[\)\uff09]', text)
+        if m:
+            inner = m.group(1)
+            # 提取括号内的前2-4个中文字符作为城市名
+            cm = _re.match(r'([\u4e00-\u9fff]{2,4})', inner)
+            if cm:
+                return cm.group(1)
+        # 直接返回前2-4个中文字符
+        m = _re.match(r'([\u4e00-\u9fff]{2,4})', text)
+        if m:
+            return m.group(1)
+        return text
 
     def _match_work_content_ai(
         self,
