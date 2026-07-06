@@ -9,6 +9,52 @@ from utils.file_utils import image_to_base64, get_image_mime_type
 class InvoiceParser:
     """发票解析服务，调用通义千问VL模型识别发票信息"""
 
+    PINYIN_CITY_MAP = {
+        "hangzhou": "杭州",
+        "tonglu": "桐庐",
+        "quzhou": "衢州",
+        "pujiang": "浦江",
+        "wenzhou": "温州",
+        "yongkang": "永康",
+        "jinhua": "金华",
+        "yiwu": "义乌",
+        "zhuji": "诸暨",
+        "shaoxing": "绍兴",
+        "ningbo": "宁波",
+        "huzhou": "湖州",
+        "jiaxing": "嘉兴",
+        "taizhou": "台州",
+        "lishui": "丽水",
+        "qingtian": "青田",
+        "ruian": "瑞安",
+        "yueqing": "乐清",
+        "cangnan": "苍南",
+        "pingyang": "平阳",
+        "shanghai": "上海",
+        "nanjing": "南京",
+        "suzhou": "苏州",
+        "wuxi": "无锡",
+        "changzhou": "常州",
+        "beijing": "北京",
+        "tianjin": "天津",
+        "guangzhou": "广州",
+        "shenzhen": "深圳",
+        "wuhan": "武汉",
+        "changsha": "长沙",
+        "nanchang": "南昌",
+        "fuzhou": "福州",
+        "xiamen": "厦门",
+        "hefei": "合肥",
+        "huangshan": "黄山",
+    }
+    PINYIN_STATION_SUFFIXES = (
+        ("hongqiao", "虹桥"),
+        ("nan", "南"),
+        ("bei", "北"),
+        ("dong", "东"),
+        ("xi", "西"),
+    )
+
     def __init__(self, api_key: str, model: str = "qwen-vl-max"):
         self.api_key = api_key
         self.model = model
@@ -233,7 +279,10 @@ class InvoiceParser:
             travel_date = f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
 
         # 回退：找所有日期，排除“开票日期”后的那个
-        all_dates = re.findall(r'(\d{4})\D(\d{1,2})\D(\d{1,2})\D', text)
+        all_dates = re.findall(
+            r'([12]\d{3})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})',
+            text
+        )
         if not travel_date and all_dates:
             # 找第一个不是“开票日期”的日期
             for y, m, d in all_dates:
@@ -279,15 +328,20 @@ class InvoiceParser:
             'raw_text': text[:200],
         }
 
-    @staticmethod
-    def _extract_train_stations(text: str):
+    @classmethod
+    def _extract_train_stations(cls, text: str):
         """
-        从火车票文本中提取出发站和到达站（纯中文站名，无需拼音映射）
+        从火车票文本中提取出发站和到达站。
 
-        火车票电子发票中总是同时包含中文站名和拼音站名，
-        直接提取中文站名即可覆盖全国所有火车站。
+        12306铁路电子客票的PDF文本顺序不稳定：有些票会先输出到达站中文、
+        再输出出发站中文，但拼音站名通常仍按实际出发→到达顺序出现。
+        因此优先用拼音站名判断方向，失败时再回退中文站名。
         """
         import re as _re
+        pinyin_stations = cls._extract_train_stations_from_pinyin(text)
+        if len(pinyin_stations) >= 2:
+            return pinyin_stations[0], pinyin_stations[1]
+
         # 提取所有“XX站”格式的中文站名（2-6个中文字符 + 站）
         raw_stations = _re.findall(r'([\u4e00-\u9fff]{2,6})站', text)
 
@@ -308,6 +362,36 @@ class InvoiceParser:
         end_loc = stations[1] if len(stations) >= 2 else ''
 
         return start_loc, end_loc
+
+    @classmethod
+    def _extract_train_stations_from_pinyin(cls, text: str) -> List[str]:
+        """按PDF中的拼音站名顺序提取站点，返回去掉“站”后缀的中文站名。"""
+        tokens = re.findall(r'\b[A-Za-z]{4,30}\b', text)
+        stations = []
+        seen = set()
+        for token in tokens:
+            station = cls._station_from_pinyin(token)
+            if station and station not in seen:
+                stations.append(station)
+                seen.add(station)
+        return stations
+
+    @classmethod
+    def _station_from_pinyin(cls, token: str) -> str:
+        """把常见铁路站拼音转为中文站名。未知拼音返回空字符串并回退中文解析。"""
+        key = token.lower()
+        city = cls.PINYIN_CITY_MAP.get(key)
+        if city:
+            return city
+
+        for suffix, suffix_cn in cls.PINYIN_STATION_SUFFIXES:
+            if key.endswith(suffix):
+                city_key = key[:-len(suffix)]
+                city = cls.PINYIN_CITY_MAP.get(city_key)
+                if city:
+                    return f"{city}{suffix_cn}"
+
+        return ""
 
     # ------------------------------------------------------------------
     #  酒店发票正则解析
@@ -453,23 +537,29 @@ class InvoiceParser:
     # ------------------------------------------------------------------
     def _extract_date(self, text: str) -> str:
         """通用日期提取（返回YYYY-MM-DD格式）"""
-        # 优先匹配完整日期格式
-        dm = re.search(r'(\d{4})\D+(\d{1,2})\D+(\d{1,2})\D', text)
-        if dm:
-            return f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
-        # 回退：YYYY-MM-DD 格式
-        dm = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', text)
-        if dm:
-            return f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
+        patterns = [
+            r'(?:开票日期|日期)[：:\s]*([12]\d{3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?',
+            r'(?:开票日期|日期)[：:\s]*([12]\d{3})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})',
+            r'([12]\d{3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?',
+            r'([12]\d{3})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})',
+        ]
+        for pat in patterns:
+            dm = re.search(pat, text)
+            if dm:
+                return f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
         return ''
 
     def _extract_amount(self, text: str) -> float:
         """通用金额提取（价税合计/合计金额）"""
-        # 优先匹配“价税合计”“合计”后的小写金额
+        tax_inclusive_amount = self._extract_tax_inclusive_amount(text)
+        if tax_inclusive_amount:
+            return tax_inclusive_amount
+
+        # 优先匹配明确字段，最后才回退到任意货币符号后的金额
         patterns = [
             r'(?:价税合计|合计金额|小写|价税合计\(小写\))[^0-9]*[¥￥]?\s*([\d,]+\.?\d*)',
-            r'[¥￥]\s*([\d,]+\.\d{2})',
             r'(?:金额|总计|总额)[^0-9]*[¥￥]?\s*([\d,]+\.?\d*)',
+            r'[¥￥][^\S\r\n]*([\d,]+\.\d{2})',
         ]
         for pat in patterns:
             m = re.search(pat, text)
@@ -479,7 +569,64 @@ class InvoiceParser:
                     return round(float(val), 2)
                 except ValueError:
                     continue
+        currency_amounts = [amount for _, amount in self._extract_currency_amounts(text) if amount > 0]
+        if currency_amounts:
+            return max(currency_amounts)
         return 0
+
+    def _extract_tax_inclusive_amount(self, text: str) -> float:
+        """
+        提取发票税后总额。
+
+        数电票/PDF文本经常先输出“金额、税额”，再输出“价税合计小写”。
+        如果直接取第一个¥金额，会把酒店等发票识别成税前金额。
+        """
+        if '价税合计' not in text and '小写' not in text:
+            return 0
+
+        currency_amounts = self._extract_currency_amounts(text)
+        positive_amounts = [amount for _, amount in currency_amounts if amount > 0]
+        if not positive_amounts:
+            return 0
+
+        if len(positive_amounts) >= 3:
+            for total in sorted(positive_amounts, reverse=True):
+                others = list(positive_amounts)
+                others.remove(total)
+                for i, amount in enumerate(others):
+                    for tax in others[i + 1:]:
+                        if abs(total - amount - tax) < 0.02:
+                            return total
+            return max(positive_amounts)
+        if len(positive_amounts) == 2:
+            return max(positive_amounts)
+        return positive_amounts[0]
+
+    @staticmethod
+    def _extract_currency_amounts(text: str) -> List[tuple]:
+        """提取带¥/￥符号的金额，兼容符号在金额前或金额后的PDF文本顺序。"""
+        matches = []
+        patterns = [
+            r'[¥￥][^\S\r\n]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)',
+            r'([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\s*[¥￥]',
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, text):
+                try:
+                    amount = round(float(m.group(1).replace(',', '')), 2)
+                except ValueError:
+                    continue
+                matches.append((m.start(), amount))
+
+        matches.sort(key=lambda item: item[0])
+        deduped = []
+        seen = set()
+        for pos, amount in matches:
+            key = (pos, amount)
+            if key not in seen:
+                deduped.append((pos, amount))
+                seen.add(key)
+        return deduped
 
     # ------------------------------------------------------------------
     #  统一校验方法
