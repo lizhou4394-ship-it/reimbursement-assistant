@@ -322,6 +322,13 @@ if step_index == 0:
                 + f"，共{sum(travel_days.values())}天"
             )
 
+        # 火车票往返配对校验
+        roundtrip_check = DataCorrelator.check_train_roundtrip(invoices)
+        if roundtrip_check['summary']:
+            st.warning("🚄 火车票往返配对提醒：\n" + roundtrip_check['summary'])
+        else:
+            st.success("✅ 火车票往返配对检查正常")
+
         st.success("🎉 所有文件解析完成！正在跳转到预览页面...")
         st.session_state.current_step = 1
         st.rerun()

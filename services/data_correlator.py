@@ -647,3 +647,103 @@ class DataCorrelator:
                 pass
 
         return None
+
+    @staticmethod
+    def check_train_roundtrip(
+        invoices: List[Dict], home_city: str = "杭州"
+    ) -> Dict:
+        """
+        检查火车票/飞机票的往返配对情况
+
+        Returns:
+            {
+                'issues': [{'city': str, 'problem': str, 'detail': str}],
+                'has_bus': bool,
+                'summary': str
+            }
+        """
+        from services.excel_generator import ExcelGenerator
+
+        issues = []
+        departures = {}  # {城市: [日期]}
+        returns = {}     # {城市: [日期]}
+        has_bus = False
+
+        for inv in invoices:
+            inv_type = inv.get('type', '')
+            date_str = inv.get('date', '')
+            start = inv.get('start_location', '')
+            end = inv.get('end_location', '')
+
+            # 检测大巴票
+            if inv_type in ('大巴', '客车', '长途汽车') or '大巴' in inv.get('raw_text', ''):
+                has_bus = True
+
+            if inv_type not in ('火车票', '飞机票'):
+                continue
+
+            start_city = ExcelGenerator._extract_city(start)
+            end_city = ExcelGenerator._extract_city(end)
+
+            if home_city in start and home_city not in end:
+                departures.setdefault(end_city, []).append(date_str)
+            elif home_city in end and home_city not in start:
+                returns.setdefault(start_city, []).append(date_str)
+            elif home_city not in start and home_city not in end:
+                if start_city and end_city and start_city != end_city:
+                    departures.setdefault(start_city, []).append(date_str)
+
+        # 检查有出发无返回的城市
+        all_cities = set(list(departures.keys()) + list(returns.keys()))
+        for city in sorted(all_cities):
+            deps = sorted(departures.get(city, []))
+            rets = sorted(returns.get(city, []))
+
+            if deps and not rets:
+                dep_str = '、'.join(deps)
+                issues.append({
+                    'city': city,
+                    'problem': 'missing_return',
+                    'detail': f'{city}: 有去程({dep_str})但无返程票',
+                })
+            elif rets and not deps:
+                ret_str = '、'.join(rets)
+                issues.append({
+                    'city': city,
+                    'problem': 'missing_departure',
+                    'detail': f'{city}: 有返程({ret_str})但无去程票',
+                })
+            elif len(deps) != len(rets):
+                dep_str = '、'.join(deps)
+                ret_str = '、'.join(rets)
+                issues.append({
+                    'city': city,
+                    'problem': 'count_mismatch',
+                    'detail': f'{city}: 去程{len(deps)}张({dep_str})，返程{len(rets)}张({ret_str})',
+                })
+
+        # 构建汇总文本
+        if not issues:
+            summary = ''
+        else:
+            problem_lines = [f'  - {i["detail"]}' for i in issues]
+            summary = f'发现 {len(issues)} 个城市的往返票可能不完整：\n' + '\n'.join(problem_lines)
+            if has_bus:
+                summary += '\n（已检测到其他交通方式票据，可能已补充）'
+            else:
+                missing_returns = [i['city'] for i in issues if i['problem'] == 'missing_return']
+                missing_departs = [i['city'] for i in issues if i['problem'] == 'missing_departure']
+                hints = []
+                if missing_returns:
+                    hints.append(f'缺少返程票: {"、".join(missing_returns)}')
+                if missing_departs:
+                    hints.append(f'缺少去程票: {"、".join(missing_departs)}')
+                if hints:
+                    summary += '\n可能缺少：' + '; '.join(hints)
+                    summary += '\n如确认缺少的是大巴票等其他票据，请补充上传或忽略此提醒。'
+
+        return {
+            'issues': issues,
+            'has_bus': has_bus,
+            'summary': summary,
+        }
