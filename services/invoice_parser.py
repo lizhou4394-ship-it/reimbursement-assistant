@@ -108,7 +108,9 @@ class InvoiceParser:
             result = self._regex_flight(text)
         elif any(kw in text for kw in ['餐饮', '餐厅', '饭店', '餐费', '酒楼', '火锅']):
             result = self._regex_restaurant(text)
-        elif any(kw in text for kw in ['快递', '顺丰', '圆通', '中通', '韵达', '申通', '邮政', '极兔']):
+        elif '运单明细' in text and '运单金额' in text:
+            result = self._regex_courier_waybill_detail(text)
+        elif any(kw in text for kw in ['快递', '顺丰', '圆通', '中通', '韵达', '申通', '邮政', '极兔', '收派服务']):
             result = self._regex_courier(text)
 
         # 统一校验：不合格则返回None，回退AI
@@ -142,8 +144,13 @@ class InvoiceParser:
             table_start = text.find('里程')
         trip_text = text[table_start:] if table_start >= 0 else text
 
-        # 提取所有日期
-        dates = re.findall(r'(\d{2}-\d{2})\s+\d{2}:\d{2}\s*[\n]?\s*[\u4e00-\u9fff]{1,2}', trip_text)
+        # 提取所有日期和时间
+        date_time_matches = re.findall(
+            r'(\d{2}-\d{2})\s+(\d{2}:\d{2})\s*[\n]?\s*[\u4e00-\u9fff]{1,2}',
+            trip_text,
+        )
+        dates = [m[0] for m in date_time_matches]
+        times = [m[1] for m in date_time_matches]
         # 提取所有金额（2位小数）
         amounts = re.findall(r'(?<!\d)(\d{1,3}\.\d{2})(?!\d)', trip_text)
 
@@ -174,12 +181,11 @@ class InvoiceParser:
             seg = re.sub(r'^[\s\n]*[\u4e00-\u9fff]{1,4}市[\s\n]*', '', seg)
             seg = re.sub(r'^[\s\n]*市[\s\n]*', '', seg)
             seg = re.sub(r'\n\d+\.?\d*\n\d+\.\d{2}.*$', '', seg, flags=re.DOTALL)
-            parts = seg.strip().split('\n')
-            parts = [p.strip() for p in parts if p.strip()]
-            parts = [p for p in parts if not re.match(r'^[\s]*(?:特惠快车|惊喜特价|快车|专车|豪华车|拼车|优享|宽敞好车|极速拼车|顺风车)[\s]*$', p)]
-            if len(parts) >= 2:
-                start = self._clean_location(parts[0])
-                end = self._clean_location(parts[1])
+            parts = self._prepare_didi_location_lines(seg)
+            start_raw, end_raw = self._split_didi_locations(parts)
+            if start_raw or end_raw:
+                start = self._clean_location(start_raw)
+                end = self._clean_location(end_raw)
                 locations.append((start, end))
             else:
                 locations.append((parts[0] if parts else '', ''))
@@ -189,11 +195,14 @@ class InvoiceParser:
             month_day = dates[i]
             loc = locations[i] if i < len(locations) else ('', '')
             car_type = car_types[i] if i < len(car_types) else ''
+            time_str = times[i] if i < len(times) else ''
             # 仅顺风车需要餐饮发票替票（拼车有发票）
             need_substitute = '顺风车' in car_type
             trips.append({
                 'type': '打车行程单',
                 'date': f'{year}-{month_day}',
+                'time': time_str,
+                'trip_index': i + 1,
                 'start_location': loc[0],
                 'end_location': loc[1],
                 'amount': float(amounts[i]) if i < len(amounts) else 0,
@@ -203,10 +212,61 @@ class InvoiceParser:
                 'nights': '',
                 'daily_rate': '',
                 'has_invoice': False,
-                'raw_text': f'行程{i+1}: {year}-{month_day} {loc[0]}-{loc[1]} ¥{amounts[i] if i < len(amounts) else "?"} [{car_type}]',
+                'raw_text': f'行程{i+1}: {year}-{month_day} {time_str} {loc[0]}-{loc[1]} ¥{amounts[i] if i < len(amounts) else "?"} [{car_type}]',
             })
 
         return trips if trips else None
+
+    def _prepare_didi_location_lines(self, seg: str) -> List[str]:
+        """清理滴滴单条行程中的地点行，保留可用于恢复换行地址的部分。"""
+        parts = seg.strip().split('\n')
+        parts = [p.strip() for p in parts if p.strip()]
+
+        cleaned = []
+        skip_words = {
+            '市', '备注', '起点', '终点', '里程[公里]', '金额[元]', '页码：1/1',
+            '页码：1/2', '页码：2/2', '#', '序号', '车型', '上车时间', '城市',
+        }
+        car_type_pattern = re.compile(
+            r'^(?:特惠快车|惊喜特价|快车|专车|豪华车|拼车|优享|宽敞好车|极速拼车|顺风车|甄选快车|特惠快|惊喜特|宽敞好|车|价)$'
+        )
+
+        for p in parts:
+            if p in skip_words:
+                continue
+            if car_type_pattern.match(p):
+                continue
+            if re.match(r'^\d+$', p):
+                continue
+            if re.match(r'^\d+\.?\d*$', p):
+                continue
+            if re.match(r'^\d{1,3}\.\d{2}$', p):
+                continue
+            cleaned.append(p)
+
+        return cleaned
+
+    def _split_didi_locations(self, parts: List[str]):
+        """把PDF换行后的地点行恢复为起点/终点。"""
+        if not parts:
+            return '', ''
+        if len(parts) == 1:
+            return parts[0], ''
+
+        pipe_indexes = [i for i, p in enumerate(parts) if '|' in p]
+        if len(pipe_indexes) >= 2:
+            split_at = pipe_indexes[1]
+            return ''.join(parts[:split_at]), ''.join(parts[split_at:])
+
+        if len(pipe_indexes) == 1:
+            pipe_idx = pipe_indexes[0]
+            if pipe_idx == 0:
+                if len(parts) >= 3:
+                    return ''.join(parts[:-1]), parts[-1]
+                return parts[0], parts[1]
+            return ''.join(parts[:pipe_idx]), ''.join(parts[pipe_idx:])
+
+        return parts[0], ''.join(parts[1:])
 
     def _extract_car_types(self, trip_text: str) -> List[str]:
         """提取每条行程的车型"""
@@ -277,6 +337,7 @@ class InvoiceParser:
         travel_date = None
         if dm:
             travel_date = f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
+        travel_time = dm.group(4) if dm else ''
 
         # 回退：找所有日期，排除“开票日期”后的那个
         all_dates = re.findall(
@@ -318,6 +379,7 @@ class InvoiceParser:
         return {
             'type': '火车票',
             'date': date_str,
+            'time': travel_time,
             'start_location': start_loc,
             'end_location': end_loc,
             'amount': amount,
@@ -417,6 +479,7 @@ class InvoiceParser:
         # 提取住宿天数和单价（如有）
         nights = ''
         daily_rate = ''
+        check_in_date, check_out_date = self._extract_hotel_stay_dates(text)
         nights_match = re.search(r'(\d+)\s*[晚天夜]', text)
         if nights_match:
             nights = int(nights_match.group(1))
@@ -434,11 +497,43 @@ class InvoiceParser:
             'end_location': '',
             'amount': amount,
             'hotel_name': hotel_name,
+            'check_in_date': check_in_date,
+            'check_out_date': check_out_date,
             'nights': nights,
             'daily_rate': daily_rate,
             'has_invoice': True,
             'raw_text': text[:200],
         }
+
+    def _extract_hotel_stay_dates(self, text: str):
+        """仅从发票明示字段中提取入住/离店日期，不做外部行程推断。"""
+        date_pat = r'([12]\d{3})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})'
+
+        def fmt(match):
+            return f'{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}' if match else ''
+
+        check_in = ''
+        check_out = ''
+
+        in_match = re.search(r'(?:入住|入店|住店|到店|入住日期|入住时间)[^\d]{0,12}' + date_pat, text)
+        out_match = re.search(r'(?:离店|退房|离店日期|退房日期|离店时间)[^\d]{0,12}' + date_pat, text)
+        if in_match:
+            check_in = fmt(in_match)
+        if out_match:
+            check_out = fmt(out_match)
+
+        range_match = re.search(
+            r'(?:入住|住宿|住店|日期|时间)[^\d]{0,12}'
+            + date_pat
+            + r'\s*(?:至|到|-|—|~)\s*'
+            + date_pat,
+            text,
+        )
+        if range_match and not (check_in and check_out):
+            check_in = f'{range_match.group(1)}-{int(range_match.group(2)):02d}-{int(range_match.group(3)):02d}'
+            check_out = f'{range_match.group(4)}-{int(range_match.group(5)):02d}-{int(range_match.group(6)):02d}'
+
+        return check_in, check_out
 
     # ------------------------------------------------------------------
     #  飞机票正则解析
@@ -515,6 +610,7 @@ class InvoiceParser:
         """正则解析快递发票"""
         date_str = self._extract_date(text)
         amount = self._extract_amount(text)
+        invoice_no = self._extract_invoice_number(text)
 
         if not amount:
             return None
@@ -525,12 +621,55 @@ class InvoiceParser:
             'start_location': '',
             'end_location': '',
             'amount': amount,
+            'invoice_number': invoice_no,
             'hotel_name': '',
             'nights': '',
             'daily_rate': '',
             'has_invoice': True,
             'raw_text': text[:200],
         }
+
+    def _regex_courier_waybill_detail(self, text: str):
+        """正则解析顺丰运单明细，逐条生成快递记录。"""
+        invoice_no = ''
+        invoice_match = re.search(r'发票号码[：:\s\S]{0,120}?([0-9]{20})', text)
+        if invoice_match:
+            invoice_no = invoice_match.group(1)
+
+        records = []
+        pattern = re.compile(
+            r'(?m)^\s*(\d+)\s*\n'
+            r'(SF[0-9A-Z]+)\s*\n'
+            r'(\d{4})/(\d{1,2})/(\d{1,2})\s*\n'
+            r'(?:.*?\n){4}'
+            r'([\d,]+\.\d{2})\s*$'
+        )
+        for m in pattern.finditer(text):
+            date_str = f'{m.group(3)}-{int(m.group(4)):02d}-{int(m.group(5)):02d}'
+            amount = round(float(m.group(6).replace(',', '')), 2)
+            records.append({
+                'type': '快递',
+                'date': date_str,
+                'start_location': '',
+                'end_location': '',
+                'amount': amount,
+                'invoice_number': invoice_no,
+                'waybill_number': m.group(2),
+                'is_waybill_detail': True,
+                'hotel_name': '',
+                'nights': '',
+                'daily_rate': '',
+                'has_invoice': True,
+                'work_content': '机器文件',
+                'raw_text': f'顺丰运单明细 {m.group(2)} {date_str} ¥{amount:.2f}',
+            })
+
+        return records or None
+
+    @staticmethod
+    def _extract_invoice_number(text: str) -> str:
+        m = re.search(r'发票号码[：:\s\S]{0,120}?([0-9]{20})', text)
+        return m.group(1) if m else ''
 
     # ------------------------------------------------------------------
     #  通用提取辅助方法
@@ -791,25 +930,25 @@ class InvoiceParser:
         # 文本型PDF：合并所有页文字为一个任务（节省AI调用）
         # 图片/扫描件：每页一个任务
         tasks = []
-        for file_info in file_list:
+        for file_rank, file_info in enumerate(file_list):
             images = file_info.get("images", [])
             page_texts = file_info.get("page_texts", [])
             all_text = "\n\n".join(pt for pt in page_texts if pt)
 
             if all_text and len(all_text) > 80:
                 # 文本型PDF：合并所有页为一个任务
-                tasks.append((images[0] if images else "", file_info["filename"], all_text))
+                tasks.append((images[0] if images else "", file_info["filename"], all_text, file_rank))
             else:
                 # 图片/扫描件：每页一个任务
                 for img_path in images:
-                    tasks.append((img_path, file_info["filename"], ""))
+                    tasks.append((img_path, file_info["filename"], "", file_rank))
 
         results = []
         results_lock = threading.Lock()
         completed = [0]  # 用列表以便在闭包中修改
         total = len(tasks)
 
-        def _parse_one(img_path, filename, page_text=""):
+        def _parse_one(img_path, filename, page_text="", file_rank=0):
             """解析单张图片（线程安全），可能返回多条记录（打车行程单）"""
             result = self.parse_single_invoice(
                 img_path, system_prompt, invoice_parse_prompt, page_text=page_text
@@ -821,8 +960,10 @@ class InvoiceParser:
                 if isinstance(result, list):
                     for r in result:
                         r["source_file"] = filename
+                        r["source_file_rank"] = file_rank
                 else:
                     result["source_file"] = filename
+                    result["source_file_rank"] = file_rank
             with results_lock:
                 completed[0] += 1
                 if progress_callback:
@@ -834,8 +975,8 @@ class InvoiceParser:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
-                executor.submit(_parse_one, img_path, fn, pt): (img_path, fn)
-                for img_path, fn, pt in tasks
+                executor.submit(_parse_one, img_path, fn, pt, file_rank): (img_path, fn)
+                for img_path, fn, pt, file_rank in tasks
             }
             for future in as_completed(future_to_task):
                 try:
@@ -850,7 +991,11 @@ class InvoiceParser:
                     print(f"解析失败: {fn}, 错误: {e}")
 
         # 按日期排序
-        results.sort(key=lambda x: x.get("date", ""))
+        results.sort(key=lambda x: (
+            x.get("date", ""),
+            x.get("source_file_rank", 0),
+            int(x.get("trip_index", 0) or 0),
+        ))
         return results
 
     def _extract_json(self, text: str):

@@ -234,7 +234,7 @@ if step_index == 0:
     if st.button("🚀 开始解析发票", type="primary", use_container_width=True):
         # 验证输入
         if not st.session_state.api_key:
-            st.warning("⚠️ 未填写 API Key，酒店日期推算和照片解析将不可用，其余功能正常")
+            st.warning("⚠️ 未填写 API Key，照片解析和工作内容智能匹配将不可用，其余功能正常")
 
         if not zip_file:
             st.error("❌ 请上传发票压缩包")
@@ -293,8 +293,8 @@ if step_index == 0:
             progress_bar.progress(1.0)
             status_text.text(f"✅ 发票识别完成，共识别 {len(invoices)} 张票据")
 
-        # 数据关联智能体：打车发票+行程单配对、酒店日期推算、工作内容匹配
-        with st.spinner("🔗 正在运行关联智能体（打车配对 + 酒店日期推算 + 工作内容匹配）..."):
+        # 数据关联智能体：打车发票+行程单配对、快递明细去重、工作内容匹配
+        with st.spinner("🔗 正在运行关联智能体（打车配对 + 快递明细整理 + 工作内容匹配）..."):
             correlator = DataCorrelator(
                 api_key=st.session_state.api_key,
                 model="qwen-max",
@@ -306,7 +306,7 @@ if step_index == 0:
                 work_match_prompt=st.session_state.work_match_prompt,
             )
             st.session_state.invoices = invoices
-            st.success("✅ 数据关联完成（打车行程单配对 + 酒店日期推算 + 工作内容匹配）")
+            st.success("✅ 数据关联完成（打车行程单配对 + 快递明细整理 + 工作内容匹配）")
 
         # 计算出差天数
         generator = ExcelGenerator(st.session_state.template_bytes)
@@ -472,6 +472,9 @@ elif step_index == 1:
             except ValueError:
                 inv["amount"] = 0.0
         st.session_state.invoices = edited_invoices
+        # 编辑日期/地点/酒店入住日期后立即同步出差天数，避免生成报销单仍使用旧统计。
+        generator = ExcelGenerator(st.session_state.template_bytes)
+        st.session_state.travel_days = generator.calculate_travel_days(edited_invoices)
         st.session_state.generated_excel = None  # 清除已生成的Excel，步骤3重新生成
         st.success("✅ 修改已保存，正在跳转...")
         st.session_state.current_step = 2
@@ -481,6 +484,15 @@ elif step_index == 1:
     st.divider()
     st.subheader("📅 出差天数统计")
     travel_days = st.session_state.get("travel_days", {})
+
+    recalc_col, hint_col = st.columns([1, 3])
+    with recalc_col:
+        if st.button("🔄 重新计算", use_container_width=True):
+            generator = ExcelGenerator(st.session_state.template_bytes)
+            st.session_state.travel_days = generator.calculate_travel_days(st.session_state.invoices)
+            st.rerun()
+    with hint_col:
+        st.caption("修改日期、地点或酒店入住/离店日期后，点击“重新计算”；点击“保存修改”也会自动更新。")
 
     if travel_days:
         cols = st.columns(len(travel_days) + 1)

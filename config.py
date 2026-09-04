@@ -76,7 +76,7 @@ PROMPT_NAMES = {
     "default_prompt": "报销规则总提示词",
     "invoice_parse": "发票识别提示词（视觉AI）",
     "invoice_parse_text": "发票识别提示词（文本解析）",
-    "hotel_infer": "酒店日期推算提示词",
+    "hotel_infer": "酒店日期规则提示词",
     "work_match": "工作内容匹配提示词",
 }
 

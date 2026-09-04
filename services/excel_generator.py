@@ -2,6 +2,7 @@
 import io
 from typing import List, Dict
 from datetime import datetime, timedelta
+from collections import Counter
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
@@ -11,6 +12,13 @@ class ExcelGenerator:
 
     # 灰色表头填充（用于酒店/其他费用的列标题行）
     _GRAY_FILL = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    _YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    _THIN_BORDER = Border(
+        left=Side(style="thin", color="000000"),
+        right=Side(style="thin", color="000000"),
+        top=Side(style="thin", color="000000"),
+        bottom=Side(style="thin", color="000000"),
+    )
 
     def __init__(self, template_bytes: bytes):
         self.wb = load_workbook(io.BytesIO(template_bytes))
@@ -26,6 +34,11 @@ class ExcelGenerator:
         work_description: str,
     ) -> bytes:
         """根据解析结果生成报销单"""
+        report_month = self._infer_report_month(invoices)
+        if report_month:
+            self.ws["A1"] = f"{report_month}月 浙江地区行程报销单"
+        self._apply_layout_defaults()
+
         # ---- 1. 分类发票 ----
         transport = []   # 火车票 + 打车 + 飞机票
         hotels = []      # 酒店
@@ -50,9 +63,14 @@ class ExcelGenerator:
 
         # ---- 3. 排序：火车票在前、打车在后，各自按日期排 ----
         TYPE_ORDER = {"火车票": 0, "飞机票": 1, "打车": 2}
+        taxi_group_rank = self._build_taxi_group_rank(transport)
         transport.sort(key=lambda x: (
             TYPE_ORDER.get(x.get("type", ""), 9),
+            taxi_group_rank.get(self._taxi_group_key(x), 0) if x.get("type") == "打车" else 0,
+            int(x.get("source_file_rank", 0) or 0) if x.get("type") == "打车" else 0,
             x.get("date", ""),
+            x.get("time", ""),
+            int(x.get("trip_index", 0) or 0),
         ))
         hotels.sort(key=lambda x: x.get("check_in_date", x.get("date", "")))
         others.sort(key=lambda x: x.get("date", ""))
@@ -68,19 +86,30 @@ class ExcelGenerator:
         cur = 3  # 当前写入行号（从第3行开始）
 
         # ---- 5-A. 城际交通：火车票 + 打车 ----
+        taxi_groups = {}
         for inv in transport:
             self._write_transport_row(cur, inv)
+            if inv.get("type") == "打车":
+                group_key = self._taxi_group_key(inv)
+                group = taxi_groups.setdefault(
+                    group_key,
+                    {"start": cur, "end": cur, "total": 0.0, "count": 0},
+                )
+                group["end"] = cur
+                group["total"] += float(inv.get("amount", 0) or 0)
+                group["count"] += 1
             cur += 1
-
-        # 空行分隔（交通块结束）
-        cur += 1
+        self._write_taxi_group_totals(taxi_groups)
 
         # ---- 5-B. 补贴 ----
         # 出差天数汇总摘要（写在补贴第一行的 D 列）
         summary_text = self._build_travel_summary(travel_days)
 
         for i, sub in enumerate(subsidies):
-            self.ws.cell(row=cur, column=5, value=sub["name"])
+            if i == 0:
+                self.ws.cell(row=cur, column=5, value=sub["name"])
+            else:
+                self.ws.cell(row=cur, column=4, value=sub["name"])
             self.ws.cell(row=cur, column=6, value=float(sub["amount"]))
             self.ws.cell(row=cur, column=7, value=sub.get("remark", ""))
             # D 列出差天数汇总摘要只写在第一行（与模板一致）
@@ -88,21 +117,17 @@ class ExcelGenerator:
                 self.ws.cell(row=cur, column=4, value=summary_text)
             cur += 1
 
-        # 空行分隔（补贴块结束）
-        cur += 1
+        # 正确模板在补贴和住宿板块前保留几行空白
+        cur += 5
 
         # ---- 5-C. 城际交通小计 ----
         transport_total = sum(float(inv.get("amount", 0)) for inv in transport)
-        self.ws.cell(row=cur, column=5, value="城际交通 小计")
-        self.ws.cell(row=cur, column=6, value=round(transport_total, 2))
-        cur += 1
-
-        # 空行分隔（小计结束）
+        self.ws.cell(row=cur, column=1, value="城际交通 小计")
         cur += 1
 
         # ---- 5-D. 住宿费 ----
         # 写入住宿费的列标题（灰色底）
-        hotel_headers = ["入住时间段", "酒店名称", "天数", "单价", "费用", "名称", "金额(元)"]
+        hotel_headers = ["入住时间段", "酒店名称", "天数", "单价", "费用\n名称", "金额(元)", "备注(超标原因/替票、替票原因）"]
         for col_idx, h in enumerate(hotel_headers, 1):
             cell = self.ws.cell(row=cur, column=col_idx, value=h)
             cell.fill = self._GRAY_FILL
@@ -119,11 +144,7 @@ class ExcelGenerator:
         cur += 1
 
         # ---- 5-E. 住宿费小计 ----
-        self.ws.cell(row=cur, column=5, value="住宿费")
-        self.ws.cell(row=cur, column=6, value=round(hotel_total, 2))
-        cur += 1
-
-        # 空行分隔（住宿费小计结束）
+        self.ws.cell(row=cur, column=1, value="住宿费")
         cur += 1
 
         # ---- 5-F. 其他费用 ----
@@ -141,8 +162,8 @@ class ExcelGenerator:
             other_total += float(inv.get("amount", 0))
             cur += 1
 
-        # 空行分隔（其他费用明细结束）
-        cur += 1
+        # 正确模板在其他费用后到总合计前预留固定空白区
+        cur = max(cur, 75)
 
         # ---- 5-G. 总合计 ----
         subsidy_total = sum(float(s["amount"]) for s in subsidies)
@@ -154,15 +175,17 @@ class ExcelGenerator:
         # ---- 5-H. 页脚 ----
         self.ws.cell(row=cur, column=1, value="已申请备用金     元")
         cur += 1
-        self.ws.cell(row=cur, column=1, value='提报内容（已提报的打"√"）')
+        self.ws.cell(row=cur, column=1, value='提报内容（已提报的打“√”）')
         self.ws.cell(row=cur, column=3,
-                      value="□出差计划表   □行程评估表  □会议资料  □跟台总结表")
+                      value="□出差计划表   □行程评估表  □会议资料  □跟台总结表  ")
         cur += 1
-        self.ws.cell(row=cur, column=1,
-                      value='备注\t部门主管及负责人对提报内容打"√"项需进行指导及审核；')
+        self.ws.cell(row=cur, column=1, value='备注')
+        self.ws.cell(row=cur, column=2,
+                      value='部门主管及负责人对提报内容打“√”项需进行指导及审核；')
         cur += 1
         self.ws.cell(row=cur, column=1,
                       value="  审批:                   会计:                                          报销人:")
+        self._apply_report_styles()
 
         # ---- 6. 输出 ----
         out = io.BytesIO()
@@ -191,6 +214,10 @@ class ExcelGenerator:
         # ====== 第一步：收集每日城市证据 ======
         date_cities: Dict = {}  # {date: {city1, city2, ...}}
         date_no_city: Dict = {}  # {date: [inv, ...]} 无城市提取的滴滴记录
+
+        # 火车/飞机票提供出行段基线；继续读取打车和酒店日期证据，
+        # 避免“存在交通票据就提前返回”而漏掉跨日行程。
+        segment_days = self._calculate_travel_days_from_transport(invoices, home_city)
 
         for inv in invoices:
             inv_type = inv.get("type", "")
@@ -285,16 +312,17 @@ class ExcelGenerator:
                     try:
                         d_in = datetime.strptime(check_in, "%Y-%m-%d").date()
                         d_out = datetime.strptime(check_out, "%Y-%m-%d").date()
-                        nights = (d_out - d_in).days
-                        if nights > 0:
+                        stay_days = (d_out - d_in).days + 1
+                        if stay_days > 0:
                             hotel_city = self._infer_hotel_city(inv, invoices)
                             if hotel_city:
                                 travel_days[hotel_city] = max(
-                                    travel_days.get(hotel_city, 0), nights
+                                    travel_days.get(hotel_city, 0), stay_days
                                 )
                     except ValueError:
                         pass
-
+        for city, days in segment_days.items():
+            travel_days[city] = max(travel_days.get(city, 0), days)
         return travel_days
 
     # ------------------------------------------------------------------
@@ -336,13 +364,14 @@ class ExcelGenerator:
     def _write_other_row(self, row: int, inv: Dict):
         """写入一条其他费用记录"""
         self.ws.cell(row=row, column=1, value=self._fmt_date(inv.get("date", "")))
-        self.ws.cell(row=row, column=2, value="")
-        self.ws.cell(row=row, column=3, value=inv.get("type", ""))
-        self.ws.cell(row=row, column=4, value=inv.get("work_content", ""))
-        # 费用名称：快递 → 快递费，其他 → 原始类型
+        self.ws.cell(row=row, column=2, value=inv.get("type", ""))
+        self.ws.cell(row=row, column=3, value="")
+        content = inv.get("work_content", "")
+        if inv.get("type") == "快递" and not content:
+            content = "机器文件"
+        self.ws.cell(row=row, column=4, value=content)
+        # 费用名称：按原始类型写入
         fee_name = inv.get("type", "")
-        if fee_name == "快递":
-            fee_name = "快递费"
         self.ws.cell(row=row, column=5, value=fee_name)
         self.ws.cell(row=row, column=6, value=float(inv.get("amount", 0)))
         self.ws.cell(row=row, column=7, value="")
@@ -372,6 +401,189 @@ class ExcelGenerator:
             parts.append(f"{city}（{days}天）")
             total += days
         return "，".join(parts) + f"，共{total}天，"
+
+    # ---------- 排序 / 分组 ----------
+    @staticmethod
+    def _infer_report_month(invoices: List[Dict]) -> int:
+        months = []
+        for inv in invoices:
+            date_str = inv.get("date", "")
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                continue
+            months.append(d.month)
+        if not months:
+            return 0
+        counts = Counter(months)
+        return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+    def _build_taxi_group_rank(self, transport: List[Dict]) -> Dict[str, int]:
+        """按行程单首次出现顺序建立分组顺序，避免按所有记录的时间混排。"""
+        group_first_rank: Dict[str, int] = {}
+        fallback_rank = 0
+        for inv in transport:
+            if inv.get("type") != "打车":
+                continue
+            key = self._taxi_group_key(inv)
+            if key in group_first_rank:
+                continue
+            # 解析阶段保存的 source_file_rank 代表 ZIP 内文件顺序；
+            # 没有该字段时按当前记录首次出现顺序回退。
+            rank = inv.get("itinerary_rank", inv.get("source_file_rank"))
+            if rank is None:
+                rank = 100000 + fallback_rank
+                fallback_rank += 1
+            group_first_rank[key] = int(rank)
+        return group_first_rank
+
+    @staticmethod
+    def _taxi_group_key(inv: Dict) -> str:
+        return inv.get("itinerary_file") or inv.get("source_file") or f"{inv.get('date', '')}_{inv.get('amount', '')}"
+
+    def _write_taxi_group_totals(self, taxi_groups: Dict):
+        for group in taxi_groups.values():
+            if group.get("count", 0) <= 0:
+                continue
+            start = group["start"]
+            end = group["end"]
+            total = round(group["total"], 2)
+            cell = self.ws.cell(row=start, column=7, value=total)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if end > start:
+                self.ws.merge_cells(start_row=start, start_column=7, end_row=end, end_column=7)
+
+    def _apply_layout_defaults(self):
+        widths = {
+            "A": 26.3,
+            "B": 36.85,
+            "C": 42.3,
+            "D": 45.07,
+            "E": 16.48,
+            "F": 12.35,
+            "G": 29.47,
+        }
+        for col, width in widths.items():
+            self.ws.column_dimensions[col].width = width
+        self.ws.row_dimensions[1].height = 20
+        self.ws.row_dimensions[2].height = 31
+
+    def _apply_report_styles(self):
+        max_row = self.ws.max_row
+        font_body = Font(name="宋体", size=11)
+        font_body_bold = Font(name="宋体", size=11, bold=True)
+        align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        for row in range(1, max_row + 1):
+            if row not in (1, 2):
+                self.ws.row_dimensions[row].height = self.ws.row_dimensions[row].height or 20
+            for col in range(1, 8):
+                cell = self.ws.cell(row=row, column=col)
+                cell.font = font_body
+                cell.border = self._THIN_BORDER
+                cell.alignment = align_center
+
+        # 标题和主表头
+        self.ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        for cell in self.ws[2]:
+            cell.font = font_body_bold
+            cell.fill = self._GRAY_FILL
+            cell.alignment = align_center
+
+        # 内容区域文本列左对齐，金额/备注居中
+        for row in range(3, max_row + 1):
+            for col in (2, 3, 4):
+                self.ws.cell(row=row, column=col).alignment = align_left
+            for col in (5, 6, 7):
+                self.ws.cell(row=row, column=col).alignment = align_center
+
+        # 分区表头和小计行
+        for row in range(3, max_row + 1):
+            first = self.ws.cell(row=row, column=1).value
+            values = [self.ws.cell(row=row, column=c).value for c in range(1, 8)]
+            if self.ws.cell(row=row, column=4).value and self.ws.cell(row=row, column=5).value == "出差补贴":
+                self.ws.row_dimensions[row].height = 53
+            if values == ["入住时间段", "酒店名称", "天数", "单价", "费用\n名称", "金额(元)", "备注(超标原因/替票、替票原因）"] or values == ["日期", "其他费用名称", None, "内容", "费用名称", "金额(元)", "备注(超标原因/替票、替票原因）"]:
+                self.ws.row_dimensions[row].height = 34 if first == "入住时间段" else 20
+                for col in range(1, 8):
+                    cell = self.ws.cell(row=row, column=col)
+                    cell.font = font_body_bold
+                    cell.fill = self._GRAY_FILL
+                    cell.alignment = align_center
+            if first in ("城际交通 小计", "住宿费"):
+                for col in range(1, 8):
+                    cell = self.ws.cell(row=row, column=col)
+                    cell.fill = self._GRAY_FILL
+                    cell.alignment = align_center
+
+        # 第一条外地打车行程的日期高亮，贴近参考表
+        for row in range(3, max_row + 1):
+            if self.ws.cell(row=row, column=5).value == "打车":
+                start_city = self._extract_city_from_location(str(self.ws.cell(row=row, column=2).value or ""))
+                if start_city and start_city != "杭州":
+                    self.ws.cell(row=row, column=1).fill = self._YELLOW_FILL
+                    break
+
+    def _calculate_travel_days_from_transport(self, invoices: List[Dict], home_city: str) -> Dict:
+        transports = [
+            inv for inv in invoices
+            if inv.get("type") in ("火车票", "飞机票") and inv.get("date")
+        ]
+        transports.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
+
+        travel_days: Dict[str, int] = {}
+        current_city = home_city
+        current_trip = None
+
+        def close_trip(trip, end_date):
+            if not trip:
+                return
+            city = trip["city"]
+            try:
+                d_in = datetime.strptime(trip["start"], "%Y-%m-%d").date()
+                d_out = datetime.strptime(end_date or trip["start"], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return
+            days = max((d_out - d_in).days + 1, 1)
+            travel_days[city] = travel_days.get(city, 0) + days
+
+        for inv in transports:
+            start_city = self._extract_city(inv.get("start_location", ""))
+            end_city = self._extract_city(inv.get("end_location", ""))
+            date = inv.get("date", "")
+            if not start_city or not end_city or start_city == end_city:
+                continue
+
+            if current_trip and start_city == current_city and end_city != current_city:
+                close_trip(current_trip, date)
+                current_trip = None
+                current_city = end_city
+                if end_city != home_city:
+                    current_trip = {"city": end_city, "start": date}
+                continue
+
+            if start_city == home_city and end_city != home_city:
+                if current_trip:
+                    close_trip(current_trip, date)
+                current_city = end_city
+                current_trip = {"city": end_city, "start": date}
+            elif current_trip and end_city == home_city:
+                close_trip(current_trip, date)
+                current_trip = None
+                current_city = home_city
+            elif not current_trip and start_city != home_city and end_city == home_city:
+                travel_days[start_city] = travel_days.get(start_city, 0) + 1
+            elif start_city != home_city and end_city != home_city:
+                if current_trip:
+                    close_trip(current_trip, date)
+                current_city = end_city
+                current_trip = {"city": end_city, "start": date}
+
+        if current_trip:
+            close_trip(current_trip, current_trip["start"])
+
+        return travel_days
 
     # ---------- 日期 / 城市辅助 ----------
     @staticmethod
