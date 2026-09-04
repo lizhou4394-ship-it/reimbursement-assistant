@@ -27,3 +27,6 @@ test_output.xlsx
 # 测试数据
 *.zip
 *.png
+
+# 本地浏览器检查产物
+.playwright-cli/
