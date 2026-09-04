@@ -4,6 +4,7 @@ import os
 import io
 import json
 import tempfile
+import zipfile
 
 # 将项目根目录加入 sys.path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -34,6 +35,45 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    :root {
+        --ra-primary: #059669;
+        --ra-primary-dark: #047857;
+        --ra-surface: #ffffff;
+        --ra-border: #d7e5e0;
+        --ra-text: #0f172a;
+        --ra-muted: #64748b;
+    }
+    /* 桌面端保持宽松的数据工作区，移动端自动收紧。 */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+    h1, h2, h3 { color: var(--ra-text); letter-spacing: -0.02em; }
+    .stButton > button, .stDownloadButton > button {
+        min-height: 44px;
+        border-radius: 10px;
+        border: 1px solid var(--ra-border);
+        font-weight: 600;
+        transition: background-color 160ms ease, border-color 160ms ease, transform 160ms ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        border-color: var(--ra-primary);
+        transform: translateY(-1px);
+    }
+    .stButton > button:focus-visible, .stDownloadButton > button:focus-visible,
+    input:focus-visible, textarea:focus-visible {
+        outline: 3px solid rgba(5, 150, 105, 0.32) !important;
+        outline-offset: 2px;
+    }
+    div[data-testid="stMetric"] {
+        background: var(--ra-surface);
+        border: 1px solid var(--ra-border);
+        border-radius: 12px;
+        padding: 0.85rem 1rem;
+    }
+    div[data-testid="stMetricLabel"] { color: var(--ra-muted); }
+    div[data-testid="stMetricValue"] { color: var(--ra-text); font-variant-numeric: tabular-nums; }
+    .stAlert { border-radius: 10px; }
     /* 手机端全局优化 */
     @media (max-width: 768px) {
         /* 主区域缩小内边距 */
@@ -55,22 +95,21 @@ st.markdown(
             font-size: 16px !important;
         }
         /* 列布局堆叠 */
-        .stColumns > div {
-            flex-direction: column !important;
-        }
+        .main .block-container { padding-top: 1rem; padding-bottom: 2rem; }
     }
     /* 全局优化 */
     .stProgress > div > div > div {
-        background-color: #4CAF50;
+        background-color: var(--ra-primary);
     }
     .stExpander > div:first-child {
         font-weight: 600;
     }
     /* 文件上传框突出显示 */
     [data-testid="stFileUploader"] {
-        border: 2px dashed #4CAF50 !important;
-        border-radius: 8px !important;
+        border: 2px dashed var(--ra-primary) !important;
+        border-radius: 12px !important;
         padding: 1rem !important;
+        background: #f0f8f6 !important;
     }
     /* 隐藏 Streamlit Cloud 右上角工具栏 */
     button[kind="icon"],
@@ -247,7 +286,16 @@ if step_index == 0:
         # 解压压缩包
         with st.spinner("📦 正在解压压缩包..."):
             extractor = ZipExtractor()
-            file_list = extractor.extract_zip(zip_file.getvalue())
+            try:
+                file_list = extractor.extract_zip(zip_file.getvalue())
+            except zipfile.BadZipFile:
+                extractor.cleanup()
+                st.error("❌ ZIP 文件无法读取，请重新压缩后再上传。")
+                st.stop()
+            except ValueError as exc:
+                extractor.cleanup()
+                st.error(f"❌ ZIP 文件包含不安全路径，已拒绝处理：{exc}")
+                st.stop()
             st.session_state.extractor = extractor
 
             img_count, pdf_count = extractor.get_file_count()
@@ -473,7 +521,9 @@ elif step_index == 1:
                 inv["amount"] = 0.0
         st.session_state.invoices = edited_invoices
         # 编辑日期/地点/酒店入住日期后立即同步出差天数，避免生成报销单仍使用旧统计。
-        generator = ExcelGenerator(st.session_state.template_bytes)
+        template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
+        st.session_state.template_bytes = template_bytes
+        generator = ExcelGenerator(template_bytes)
         st.session_state.travel_days = generator.calculate_travel_days(edited_invoices)
         st.session_state.generated_excel = None  # 清除已生成的Excel，步骤3重新生成
         st.success("✅ 修改已保存，正在跳转...")
@@ -488,7 +538,9 @@ elif step_index == 1:
     recalc_col, hint_col = st.columns([1, 3])
     with recalc_col:
         if st.button("🔄 重新计算", use_container_width=True):
-            generator = ExcelGenerator(st.session_state.template_bytes)
+            template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
+            st.session_state.template_bytes = template_bytes
+            generator = ExcelGenerator(template_bytes)
             st.session_state.travel_days = generator.calculate_travel_days(st.session_state.invoices)
             st.rerun()
     with hint_col:
@@ -553,7 +605,9 @@ elif step_index == 2:
     if not st.session_state.generated_excel:
         with st.spinner("🔄 正在生成报销单..."):
             try:
-                generator = ExcelGenerator(st.session_state.template_bytes)
+                template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
+                st.session_state.template_bytes = template_bytes
+                generator = ExcelGenerator(template_bytes)
                 excel_bytes = generator.generate(
                     invoices=invoices,
                     travel_days=travel_days,

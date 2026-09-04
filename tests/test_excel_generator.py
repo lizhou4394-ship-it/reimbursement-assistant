@@ -107,6 +107,19 @@ class ExcelGeneratorRegressionTest(unittest.TestCase):
         self.assertEqual(ws["G5"].value, 40)
         self.assertTrue(any(str(rng) == "G3:G4" for rng in ws.merged_cells.ranges))
 
+    def test_export_contains_transport_and_hotel_subtotals(self):
+        generator = ExcelGenerator(blank_template_bytes())
+        invoices = [
+            {"type": "火车票", "date": "2026-07-01", "start_location": "杭州东", "end_location": "温州南", "amount": 100},
+            {"type": "酒店", "date": "2026-07-02", "hotel_name": "温州酒店", "amount": 200},
+        ]
+
+        ws = load_workbook(BytesIO(generator.generate(invoices, {}, ""))).active
+        transport_subtotal = next(row for row in ws.iter_rows() if row[0].value == "城际交通 小计")
+        hotel_subtotal = next(row for row in ws.iter_rows() if row[0].value == "住宿费")
+        self.assertEqual(transport_subtotal[5].value, 100)
+        self.assertEqual(hotel_subtotal[5].value, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

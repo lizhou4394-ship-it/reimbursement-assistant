@@ -123,6 +123,7 @@ class ExcelGenerator:
         # ---- 5-C. 城际交通小计 ----
         transport_total = sum(float(inv.get("amount", 0)) for inv in transport)
         self.ws.cell(row=cur, column=1, value="城际交通 小计")
+        self.ws.cell(row=cur, column=6, value=round(transport_total, 2))
         cur += 1
 
         # ---- 5-D. 住宿费 ----
@@ -145,6 +146,7 @@ class ExcelGenerator:
 
         # ---- 5-E. 住宿费小计 ----
         self.ws.cell(row=cur, column=1, value="住宿费")
+        self.ws.cell(row=cur, column=6, value=round(hotel_total, 2))
         cur += 1
 
         # ---- 5-F. 其他费用 ----

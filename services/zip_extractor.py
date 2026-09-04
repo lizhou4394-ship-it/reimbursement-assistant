@@ -1,6 +1,7 @@
 """压缩包解压服务"""
 import os
 import zipfile
+from pathlib import Path
 import fitz  # PyMuPDF
 from typing import List, Dict, Tuple
 from utils.file_utils import is_supported_file, is_pdf, is_image, create_temp_dir
@@ -32,8 +33,17 @@ class ZipExtractor:
         with open(zip_path, "wb") as f:
             f.write(zip_bytes)
 
-        # 解压
+        # 安全解压：拒绝绝对路径、父目录跳转和符号链接，避免 ZIP 路径穿越。
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            temp_root = Path(self.temp_dir).resolve()
+            for member in zip_ref.infolist():
+                member_path = (temp_root / member.filename).resolve()
+                if temp_root != member_path and temp_root not in member_path.parents:
+                    raise ValueError(f"压缩包包含非法路径: {member.filename}")
+                # ZIP 可携带 Unix 权限位；拒绝符号链接，避免解压后跟随链接写入外部路径。
+                mode = (member.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError(f"压缩包包含不支持的符号链接: {member.filename}")
             zip_ref.extractall(self.temp_dir)
 
         # 遍历解压后的文件

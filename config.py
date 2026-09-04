@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 通义千问 API 配置
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-70a3079eba7e462eb33f90ea77d9c51a")
+# API Key 只从环境变量读取，禁止在源码中保存密钥。
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 DEFAULT_MODEL = "qwen-vl-max"
 
 # 支持的费用类型
