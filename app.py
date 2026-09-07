@@ -43,6 +43,20 @@ def _date_is_valid(value: str) -> bool:
         return False
 
 
+def _generation_fingerprint(invoices, travel_days, work_description: str) -> str:
+    """生成当前报销数据指纹，避免用户绕过保存按钮时下载旧 Excel。"""
+    return json.dumps(
+        {
+            "invoices": invoices,
+            "travel_days": travel_days,
+            "work_description": work_description,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
 # ========== 页面配置 ==========
 st.set_page_config(
     page_title="报销助手智能体",
@@ -185,6 +199,8 @@ if "invoices" not in st.session_state:
     st.session_state.invoices = []
 if "generated_excel" not in st.session_state:
     st.session_state.generated_excel = None
+if "generated_excel_fingerprint" not in st.session_state:
+    st.session_state.generated_excel_fingerprint = None
 if "current_step" not in st.session_state:
     st.session_state.current_step = 0
 
@@ -564,6 +580,7 @@ elif step_index == 1:
         generator = ExcelGenerator(template_bytes)
         st.session_state.travel_days = generator.calculate_travel_days(edited_invoices)
         st.session_state.generated_excel = None  # 清除已生成的Excel，步骤3重新生成
+        st.session_state.generated_excel_fingerprint = None
         st.success("✅ 修改已保存，正在跳转...")
         st.session_state.current_step = 2
         st.rerun()
@@ -581,6 +598,7 @@ elif step_index == 1:
             generator = ExcelGenerator(template_bytes)
             st.session_state.travel_days = generator.calculate_travel_days(st.session_state.invoices)
             st.session_state.generated_excel = None
+            st.session_state.generated_excel_fingerprint = None
             st.rerun()
     with hint_col:
         st.caption("修改日期、地点或酒店入住/离店日期后，点击“重新计算”；点击“保存修改”也会自动更新。")
@@ -621,6 +639,7 @@ elif step_index == 2:
     total_reimburse = total_all - meal_exclude
     total_days = sum(travel_days.values())
     subsidy = total_days * 50
+    generation_fingerprint = _generation_fingerprint(invoices, travel_days, work_description)
 
     # 2x2 布局（窄屏友好）
     row1_col1, row1_col2 = st.columns(2)
@@ -641,7 +660,10 @@ elif step_index == 2:
     st.divider()
 
     # 自动生成 Excel（进入步骤3时立即执行）
-    if not st.session_state.generated_excel:
+    if (
+        not st.session_state.generated_excel
+        or st.session_state.get("generated_excel_fingerprint") != generation_fingerprint
+    ):
         with st.spinner("🔄 正在生成报销单..."):
             try:
                 template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
@@ -653,6 +675,7 @@ elif step_index == 2:
                     work_description=work_description,
                 )
                 st.session_state.generated_excel = excel_bytes
+                st.session_state.generated_excel_fingerprint = generation_fingerprint
             except Exception as e:
                 st.error(f"❌ 生成失败: {e}")
 
@@ -672,4 +695,5 @@ elif step_index == 2:
         # 重新生成按钮（数据修改后可重新生成）
         if st.button("🔄 重新生成", use_container_width=True):
             st.session_state.generated_excel = None
+            st.session_state.generated_excel_fingerprint = None
             st.rerun()
