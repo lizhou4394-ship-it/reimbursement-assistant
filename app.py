@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import zipfile
+from datetime import datetime
 
 # 将项目根目录加入 sys.path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -22,6 +23,24 @@ from services.zip_extractor import ZipExtractor
 from services.invoice_parser import InvoiceParser
 from services.excel_generator import ExcelGenerator
 from services.data_correlator import DataCorrelator
+
+
+def _amount_or_zero(value) -> float:
+    """用于页面汇总展示：非法输入按 0 展示，但保存时会阻止继续。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _date_is_valid(value: str) -> bool:
+    if not value:
+        return True
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 # ========== 页面配置 ==========
@@ -432,7 +451,7 @@ elif step_index == 1:
         container = tabs[tab_idx] if len(tab_labels) > 1 else tabs[0]
         with container:
             # 分类小计
-            cat_total = sum(float(inv.get("amount", 0)) for _, inv in items)
+            cat_total = sum(_amount_or_zero(inv.get("amount", 0)) for _, inv in items)
             st.caption(f"{len(items)} 张，合计 ¥{cat_total:.2f}")
 
             for i, inv in items:
@@ -445,7 +464,8 @@ elif step_index == 1:
                     col1, col2, col3 = st.columns(3)
                     with col1:
                         inv["date"] = st.text_input(
-                            "日期", value=inv.get("date", ""), key=f"date_{i}"
+                            "日期", value=inv.get("date", ""), key=f"date_{i}",
+                            help="格式：YYYY-MM-DD，例如 2026-09-07",
                         )
                         inv["type"] = st.selectbox(
                             "费用类型",
@@ -456,7 +476,8 @@ elif step_index == 1:
                             key=f"type_{i}",
                         )
                         inv["amount"] = st.text_input(
-                            "金额", value=str(inv.get("amount", "")), key=f"amount_{i}"
+                            "金额", value=str(inv.get("amount", "")), key=f"amount_{i}",
+                            help="请输入非负数字，最多保留两位小数",
                         )
 
                     with col2:
@@ -514,11 +535,28 @@ elif step_index == 1:
 
     # 保存修改按钮
     if st.button("💾 保存修改", type="primary", use_container_width=True):
-        for inv in edited_invoices:
+        validation_errors = []
+        for i, inv in enumerate(edited_invoices):
+            date_fields = [("日期", inv.get("date", ""))]
+            if inv.get("type") == "酒店":
+                date_fields.extend([
+                    ("入住日期", inv.get("check_in_date", "")),
+                    ("离店日期", inv.get("check_out_date", "")),
+                ])
+            for field_name, field_value in date_fields:
+                if not _date_is_valid(field_value):
+                    validation_errors.append(f"第 {i + 1} 条{field_name}不是 YYYY-MM-DD 格式")
             try:
-                inv["amount"] = float(inv.get("amount", 0))
-            except ValueError:
-                inv["amount"] = 0.0
+                amount = float(inv.get("amount", 0))
+                if amount < 0:
+                    validation_errors.append(f"第 {i + 1} 条金额不能为负数")
+            except (TypeError, ValueError):
+                validation_errors.append(f"第 {i + 1} 条金额不是有效数字")
+        if validation_errors:
+            st.error("请先修正以下内容：\n" + "\n".join(f"- {item}" for item in validation_errors))
+            st.stop()
+        for inv in edited_invoices:
+            inv["amount"] = float(inv.get("amount", 0))
         st.session_state.invoices = edited_invoices
         # 编辑日期/地点/酒店入住日期后立即同步出差天数，避免生成报销单仍使用旧统计。
         template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
@@ -542,6 +580,7 @@ elif step_index == 1:
             st.session_state.template_bytes = template_bytes
             generator = ExcelGenerator(template_bytes)
             st.session_state.travel_days = generator.calculate_travel_days(st.session_state.invoices)
+            st.session_state.generated_excel = None
             st.rerun()
     with hint_col:
         st.caption("修改日期、地点或酒店入住/离店日期后，点击“重新计算”；点击“保存修改”也会自动更新。")
@@ -574,9 +613,9 @@ elif step_index == 2:
     work_description = st.session_state.get("work_description", "")
 
     st.subheader("📊 数据汇总")
-    total_all = sum(float(inv.get("amount", 0)) for inv in invoices)
+    total_all = sum(_amount_or_zero(inv.get("amount", 0)) for inv in invoices)
     meal_exclude = sum(
-        float(inv.get("amount", 0)) for inv in invoices
+        _amount_or_zero(inv.get("amount", 0)) for inv in invoices
         if inv.get("type") == "餐饮" and not inv.get("is_entertainment", False)
     )
     total_reimburse = total_all - meal_exclude

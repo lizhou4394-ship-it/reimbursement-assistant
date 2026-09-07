@@ -98,6 +98,14 @@ def get_api_key(session_api_key: str = "") -> str:
     """获取API Key，优先使用页面输入的值"""
     if session_api_key:
         return session_api_key
+    # Streamlit Cloud 使用 st.secrets；本地开发继续使用环境变量。
+    try:
+        import streamlit as st
+        secret_key = st.secrets.get("DASHSCOPE_API_KEY", "")
+        if secret_key:
+            return secret_key
+    except Exception:
+        pass
     return DASHSCOPE_API_KEY
 
 
