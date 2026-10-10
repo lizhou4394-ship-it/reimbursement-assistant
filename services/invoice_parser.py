@@ -144,6 +144,10 @@ class InvoiceParser:
             table_start = text.find('里程')
         trip_text = text[table_start:] if table_start >= 0 else text
 
+        # 部分滴滴 PDF 会在页宽不足时把上车时间拆成两行，例如
+        # "16:\\n17"。只修复时间内部的换行，避免影响地址的真实换行。
+        trip_text = re.sub(r'(\d{2}):\s*\n\s*(\d{2})', r'\1:\2', trip_text)
+
         # 提取所有日期和时间
         date_time_matches = re.findall(
             r'(\d{2}-\d{2})\s+(\d{2}:\d{2})\s*[\n]?\s*[\u4e00-\u9fff]{1,2}',

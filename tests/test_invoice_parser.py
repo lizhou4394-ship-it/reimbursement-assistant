@@ -147,6 +147,38 @@ class InvoiceParserRegressionTest(unittest.TestCase):
         self.assertEqual(result[0]["end_location"], "云睦宝庆苑")
         self.assertEqual(result[0]["time"], "17:57")
 
+    def test_didi_itinerary_handles_time_wrapped_across_lines(self):
+        text = """滴滴出行-行程单
+申请日期：2026-10-07
+行程起止日期：2026-09-14 至 2026-09-15
+共2笔行程，合计81.50元
+备注
+1
+特惠快车
+09-14 16:
+17 周一
+杭州市
+起点|西湖文化广场
+终点|杭州东站-网约车上客区
+19.5
+29.40
+2
+特惠快车
+09-15 18:
+22 周二
+杭州市
+起点|杭州东站-网约车上客区
+终点|西湖文化广场
+33.7
+52.10
+"""
+
+        result = self.parser._try_parse_regex(text)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([trip["time"] for trip in result], ["16:17", "18:22"])
+        self.assertEqual([trip["amount"] for trip in result], [29.40, 52.10])
+
     def test_courier_waybill_detail_returns_line_items(self):
         text = """顺丰电子发票 — 运单明细
 #
