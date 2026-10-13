@@ -129,6 +129,6 @@ class DidiFormatsTest(unittest.TestCase):
                 model.assert_not_called()
 
     def test_intentionally_skipped_invoice_is_not_reported_as_failed(self):
-        result = self.parser.parse_all_invoices([{"filename":"invoice.pdf", "page_texts":["电子发票 旅客运输服务"], "images":[]}])
+        result = self.parser.parse_all_invoices([{"filename":"invoice.pdf", "page_texts":["滴滴电子发票 旅客运输服务"], "images":[]}])
         self.assertEqual(result, [])
         self.assertEqual(self.parser.failed_files, [])
