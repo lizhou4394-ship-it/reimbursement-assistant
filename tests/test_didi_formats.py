@@ -128,7 +128,8 @@ class DidiFormatsTest(unittest.TestCase):
                 self.assertEqual(self.parser.failed_files, ["mixed.pdf"])
                 model.assert_not_called()
 
-    def test_intentionally_skipped_invoice_is_not_reported_as_failed(self):
-        result = self.parser.parse_all_invoices([{"filename":"invoice.pdf", "page_texts":["滴滴电子发票 旅客运输服务"], "images":[]}])
-        self.assertEqual(result, [])
+    def test_standalone_taxi_invoice_is_preserved(self):
+        result = self.parser.parse_all_invoices([{"filename":"invoice.pdf", "page_texts":["滴滴电子发票 旅客运输服务\n开票日期：2026年09月05日\n（小写）￥30.00"], "images":[]}])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["amount"], 30)
         self.assertEqual(self.parser.failed_files, [])

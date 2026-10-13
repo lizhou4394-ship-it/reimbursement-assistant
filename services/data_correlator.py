@@ -1,5 +1,6 @@
 """数据关联智能体 - 跨文档交叉分析匹配"""
 import json
+from decimal import Decimal
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 
@@ -83,13 +84,32 @@ class DataCorrelator:
         """
         matched = []
         used_itineraries = set()
+        invoiced_groups = set()
+        groups = {}
+        for i, trip in enumerate(taxi_itineraries):
+            if trip.get("source_file"):
+                groups.setdefault(trip["source_file"], []).append(i)
 
         for invoice in taxi_invoices:
             inv_amount = float(invoice.get("amount", 0))
+            # 汇总发票覆盖整份行程单，不能额外作为一条费用重复计入。
+            group_candidates = []
+            for name, indexes in groups.items():
+                if name in invoiced_groups or any(i in used_itineraries for i in indexes):
+                    continue
+                total = sum(Decimal(str(taxi_itineraries[i]["amount"])) for i in indexes)
+                if total == Decimal(str(invoice["amount"])):
+                    gap = min(self._date_gap_days(invoice.get("date", ""), taxi_itineraries[i].get("date", "")) for i in indexes)
+                    group_candidates.append((gap, name))
+            if group_candidates:
+                invoiced_groups.add(min(group_candidates)[1])
+                continue
             candidates = []
 
             for i, itin in enumerate(taxi_itineraries):
                 if i in used_itineraries:
+                    continue
+                if itin.get("source_file") in invoiced_groups:
                     continue
                 itin_amount = float(itin.get("amount", 0))
                 # 金额匹配（允许0.01误差）
@@ -150,7 +170,7 @@ class DataCorrelator:
                     "start_location": itin.get("start_location", ""),
                     "end_location": itin.get("end_location", ""),
                     "amount": float(itin.get("amount", 0)),
-                    "has_invoice": False,
+                    "has_invoice": itin.get("source_file") in invoiced_groups,
                     "need_substitute": itin.get("need_substitute", False),
                     "car_type": itin.get("car_type", ""),
                     "source_file": itin.get("source_file", ""),

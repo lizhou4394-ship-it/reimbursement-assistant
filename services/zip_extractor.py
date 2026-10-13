@@ -14,6 +14,7 @@ class ZipExtractor:
     def __init__(self):
         self.temp_dir = create_temp_dir()
         self.extracted_files: List[Dict] = []
+        self.duplicate_files = []
 
     def extract_zip(self, zip_bytes: bytes) -> List[Dict]:
         """
@@ -51,8 +52,13 @@ class ZipExtractor:
 
         # 遍历解压后的文件
         self.extracted_files = []
+        self.duplicate_files = []
+        content_sources = {}
         for root, dirs, files in os.walk(source_dir):
-            for filename in files:
+            dirs[:] = sorted(d for d in dirs if d != "__MACOSX")
+            for filename in sorted(files):
+                if filename.startswith("._"):
+                    continue
                 if filename == "upload.zip":
                     continue
                 if not is_supported_file(filename):
@@ -60,6 +66,15 @@ class ZipExtractor:
 
                 filepath = os.path.join(root, filename)
                 relative_name = os.path.relpath(filepath, source_dir).replace("\\", "/")
+                with open(filepath, "rb") as stream:
+                    hasher = hashlib.sha256()
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                    digest = hasher.hexdigest()
+                if digest in content_sources:
+                    self.duplicate_files.append({"filename": relative_name, "original": content_sources[digest]})
+                    continue
+                content_sources[digest] = relative_name
                 file_info = {
                     "filename": relative_name,
                     "filepath": filepath,
