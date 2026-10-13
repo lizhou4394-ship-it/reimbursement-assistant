@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from collections import Counter
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+from services.record_validation import normalize_record
 
 
 class ExcelGenerator:
@@ -34,6 +35,10 @@ class ExcelGenerator:
         work_description: str,
     ) -> bytes:
         """根据解析结果生成报销单"""
+        invoices = [normalize_record(inv, allow_zero=True) for inv in invoices]
+        if any(inv["type"] in {"打车行程单", "出差补贴", "通讯补贴", "餐补"} for inv in invoices):
+            raise ValueError("行程单请先关联为打车记录；补贴由系统自动生成，请勿作为票据费用输入")
+        self.calculate_travel_days(invoices)
         report_month = self._infer_report_month(invoices)
         if report_month:
             self.ws["A1"] = f"{report_month}月 浙江地区行程报销单"
@@ -219,7 +224,7 @@ class ExcelGenerator:
 
         # 火车/飞机票提供出行段基线；继续读取打车和酒店日期证据，
         # 避免“存在交通票据就提前返回”而漏掉跨日行程。
-        segment_days = self._calculate_travel_days_from_transport(invoices, home_city)
+        segment_dates = self._calculate_travel_days_from_transport(invoices, home_city, return_dates=True)
 
         for inv in invoices:
             inv_type = inv.get("type", "")
@@ -237,6 +242,8 @@ class ExcelGenerator:
                 for loc_key in ("start_location", "end_location"):
                     loc = inv.get(loc_key, "")
                     city = self._extract_city_from_location(loc)
+                    if city == home_city:
+                        found_city = True
                     if city and city != home_city and len(city) >= 2:
                         date_cities.setdefault(d, set()).add(city)
                         found_city = True
@@ -286,24 +293,22 @@ class ExcelGenerator:
                 city_dates.setdefault(city, set()).add(d)
 
         # 每个城市独立计算出差天数
-        travel_days: Dict[str, int] = {}
+        expanded_dates: Dict[str, set] = {}
         for city, dates in city_dates.items():
             sorted_dates = sorted(dates)
             if not sorted_dates:
                 continue
 
             # 按间隔≥3天分段（允许1-2天证据缺口被吸收）
-            total = 0
             seg_start = sorted_dates[0]
             prev = sorted_dates[0]
             for d in sorted_dates[1:]:
                 gap = (d - prev).days
                 if gap >= 3:
-                    total += (prev - seg_start).days + 1
+                    expanded_dates.setdefault(city, set()).update(seg_start + timedelta(days=i) for i in range((prev - seg_start).days + 1))
                     seg_start = d
                 prev = d
-            total += (prev - seg_start).days + 1
-            travel_days[city] = total
+            expanded_dates.setdefault(city, set()).update(seg_start + timedelta(days=i) for i in range((prev - seg_start).days + 1))
 
         # 酒店发票补充
         for inv in invoices:
@@ -317,15 +322,22 @@ class ExcelGenerator:
                         stay_days = (d_out - d_in).days + 1
                         if stay_days > 0:
                             hotel_city = self._infer_hotel_city(inv, invoices)
-                            if hotel_city:
-                                travel_days[hotel_city] = max(
-                                    travel_days.get(hotel_city, 0), stay_days
-                                )
+                            if hotel_city and hotel_city != home_city:
+                                expanded_dates.setdefault(hotel_city, set()).update(d_in + timedelta(days=i) for i in range(stay_days))
                     except ValueError:
                         pass
-        for city, days in segment_days.items():
-            travel_days[city] = max(travel_days.get(city, 0), days)
+        for city, dates in segment_dates.items():
+            expanded_dates.setdefault(city, set()).update(dates)
+        travel_days = {city: len(dates) for city, dates in expanded_dates.items()}
+        self.calculated_travel_days = travel_days
+        self.travel_calendar_days = len(set().union(*expanded_dates.values())) if expanded_dates else 0
         return travel_days
+
+    def total_travel_days(self, travel_days):
+        """城市统计可共享过渡日；总天数和补贴按自然日去重。"""
+        if travel_days == getattr(self, "calculated_travel_days", None):
+            return self.travel_calendar_days
+        return sum(travel_days.values()) if travel_days else 0
 
     # ------------------------------------------------------------------
     #  内部辅助方法
@@ -335,7 +347,10 @@ class ExcelGenerator:
         self.ws.cell(row=row, column=1, value=self._fmt_date(inv.get("date", "")))
         self.ws.cell(row=row, column=2, value=inv.get("start_location", ""))
         self.ws.cell(row=row, column=3, value=inv.get("end_location", ""))
-        self.ws.cell(row=row, column=4, value=inv.get("work_content", ""))
+        content = inv.get("work_content", "")
+        if inv.get("need_substitute", False):
+            content = (content + "；" if content else "") + "餐费代替"
+        self.ws.cell(row=row, column=4, value=content)
         self.ws.cell(row=row, column=5, value=inv.get("type", ""))
         self.ws.cell(row=row, column=6, value=float(inv.get("amount", 0)))
         # 顺风车/拼车需要餐费代替
@@ -381,7 +396,7 @@ class ExcelGenerator:
     # ---------- 补贴 ----------
     def _generate_subsidies(self, travel_days: Dict) -> List[Dict]:
         """生成补贴数据"""
-        total_days = sum(travel_days.values()) if travel_days else 0
+        total_days = self.total_travel_days(travel_days)
         subs = []
         if total_days > 0:
             subs.append({
@@ -398,11 +413,9 @@ class ExcelGenerator:
         if not travel_days:
             return ""
         parts = []
-        total = 0
         for city, days in travel_days.items():
             parts.append(f"{city}（{days}天）")
-            total += days
-        return "，".join(parts) + f"，共{total}天，"
+        return "，".join(parts) + f"，自然日共{self.total_travel_days(travel_days)}天，"
 
     # ---------- 排序 / 分组 ----------
     @staticmethod
@@ -527,14 +540,14 @@ class ExcelGenerator:
                     self.ws.cell(row=row, column=1).fill = self._YELLOW_FILL
                     break
 
-    def _calculate_travel_days_from_transport(self, invoices: List[Dict], home_city: str) -> Dict:
+    def _calculate_travel_days_from_transport(self, invoices: List[Dict], home_city: str, return_dates=False) -> Dict:
         transports = [
             inv for inv in invoices
             if inv.get("type") in ("火车票", "飞机票") and inv.get("date")
         ]
         transports.sort(key=lambda x: (x.get("date", ""), x.get("time", "")))
 
-        travel_days: Dict[str, int] = {}
+        travel_dates: Dict[str, set] = {}
         current_city = home_city
         current_trip = None
 
@@ -548,7 +561,7 @@ class ExcelGenerator:
             except (ValueError, TypeError):
                 return
             days = max((d_out - d_in).days + 1, 1)
-            travel_days[city] = travel_days.get(city, 0) + days
+            travel_dates.setdefault(city, set()).update(d_in + timedelta(days=i) for i in range(days))
 
         for inv in transports:
             start_city = self._extract_city(inv.get("start_location", ""))
@@ -575,7 +588,10 @@ class ExcelGenerator:
                 current_trip = None
                 current_city = home_city
             elif not current_trip and start_city != home_city and end_city == home_city:
-                travel_days[start_city] = travel_days.get(start_city, 0) + 1
+                try:
+                    travel_dates.setdefault(start_city, set()).add(datetime.strptime(date, "%Y-%m-%d").date())
+                except (ValueError, TypeError):
+                    pass
             elif start_city != home_city and end_city != home_city:
                 if current_trip:
                     close_trip(current_trip, date)
@@ -585,7 +601,7 @@ class ExcelGenerator:
         if current_trip:
             close_trip(current_trip, current_trip["start"])
 
-        return travel_days
+        return travel_dates if return_dates else {city: len(dates) for city, dates in travel_dates.items()}
 
     # ---------- 日期 / 城市辅助 ----------
     @staticmethod
@@ -659,6 +675,9 @@ class ExcelGenerator:
         check_in = hotel.get("check_in_date", "")
         if not hotel_name or not check_in:
             return ""
+        city = self._extract_city_from_location(hotel_name) if "市" in hotel_name or "县" in hotel_name else ""
+        if city:
+            return city
 
         try:
             check_in_date = datetime.strptime(check_in, "%Y-%m-%d").date()
