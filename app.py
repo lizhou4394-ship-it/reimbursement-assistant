@@ -5,6 +5,8 @@ import io
 import json
 import tempfile
 import zipfile
+import math
+import re
 from datetime import datetime
 
 # 将项目根目录加入 sys.path
@@ -23,24 +25,58 @@ from services.zip_extractor import ZipExtractor
 from services.invoice_parser import InvoiceParser
 from services.excel_generator import ExcelGenerator
 from services.data_correlator import DataCorrelator
+from services.record_validation import normalize_record
 
 
 def _amount_or_zero(value) -> float:
     """用于页面汇总展示：非法输入按 0 展示，但保存时会阻止继续。"""
     try:
-        return float(value)
+        amount = float(value)
+        return amount if math.isfinite(amount) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
 
-def _date_is_valid(value: str) -> bool:
-    if not value:
-        return True
-    try:
-        datetime.strptime(value, "%Y-%m-%d")
-        return True
-    except (TypeError, ValueError):
-        return False
+EDITOR_FIELDS = {
+    "date": "date", "type": "type", "amount": "amount", "start": "start_location",
+    "end": "end_location", "work": "work_content", "hotel": "hotel_name",
+    "checkin": "check_in_date", "checkout": "check_out_date", "nights": "nights",
+    "rate": "daily_rate", "entertain": "is_entertainment", "substitute": "need_substitute",
+}
+
+
+def _sync_editor_widgets():
+    """导航点击与字段编辑同一次提交时，也保留最新输入。"""
+    if st.session_state.current_step != 1:
+        return
+    for i, invoice in enumerate(st.session_state.invoices):
+        for prefix, field in EDITOR_FIELDS.items():
+            key = f"{prefix}_{i}"
+            if key in st.session_state:
+                invoice[field] = st.session_state[key]
+
+
+def _navigate(step):
+    _sync_editor_widgets()
+    st.session_state.current_step = step
+
+
+def _clear_editor_widgets():
+    for key in list(st.session_state):
+        if any(re.fullmatch(re.escape(prefix) + r"_\d+", key) for prefix in EDITOR_FIELDS):
+            del st.session_state[key]
+
+
+def _validated_invoices(invoices):
+    normalized, errors = [], []
+    for i, invoice in enumerate(invoices):
+        try:
+            if invoice.get("type") in {"出差补贴", "通讯补贴", "餐补", "打车行程单"}:
+                raise ValueError("补贴由系统自动生成，行程单应为打车记录，请核对费用类型")
+            normalized.append(normalize_record(invoice, allow_zero=True))
+        except (ValueError, TypeError, OverflowError) as exc:
+            errors.append(f"第 {i + 1} 条：{exc}")
+    return normalized, errors
 
 
 def _generation_fingerprint(invoices, travel_days, work_description: str) -> str:
@@ -222,7 +258,7 @@ with st.sidebar:
     # 模型选择
     st.session_state.model = st.selectbox(
         "模型选择",
-        options=["qwen-vl-max", "qwen-vl-plus", "qwen-max"],
+        options=["qwen-vl-max", "qwen-vl-plus"],
         index=0,
         help="推荐使用 qwen-vl-max，视觉识别能力最强",
     )
@@ -252,27 +288,23 @@ with st.sidebar:
             )
             if st.button(f"🔄 重置", key=f"reset_{pkey}"):
                 st.session_state[state_key] = load_prompt(pkey)
+                del st.session_state[f"ta_{pkey}"]
                 st.rerun()
 
 
 # ========== 主区域 ==========
 st.title("📋 报销助手智能体")
 st.caption("上传发票压缩包和工作描述，自动生成报销单")
+st.caption("版本：2026.10.13 · 识别完整性与导出校验更新")
 
 # 步骤导航
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    if st.button("1️⃣ 上传文件", use_container_width=True, type="primary" if st.session_state.current_step == 0 else "secondary"):
-        st.session_state.current_step = 0
-        st.rerun()
+    st.button("1️⃣ 上传文件", use_container_width=True, type="primary" if st.session_state.current_step == 0 else "secondary", on_click=_navigate, args=(0,))
 with col_b:
-    if st.button("2️⃣ 预览与编辑", use_container_width=True, type="primary" if st.session_state.current_step == 1 else "secondary"):
-        st.session_state.current_step = 1
-        st.rerun()
+    st.button("2️⃣ 预览与编辑", use_container_width=True, type="primary" if st.session_state.current_step == 1 else "secondary", on_click=_navigate, args=(1,))
 with col_c:
-    if st.button("3️⃣ 生成报销单", use_container_width=True, type="primary" if st.session_state.current_step == 2 else "secondary"):
-        st.session_state.current_step = 2
-        st.rerun()
+    st.button("3️⃣ 生成报销单", use_container_width=True, type="primary" if st.session_state.current_step == 2 else "secondary", on_click=_navigate, args=(2,))
 
 st.divider()
 
@@ -282,6 +314,10 @@ if step_index > 0 and st.session_state.get("failed_files"):
     st.warning("以下文件未完整识别，当前报销数据不包含这些文件。请返回上传页重试；若继续导出，请根据原单在 Excel 中补齐：")
     for failed_filename in st.session_state.failed_files:
         st.text(failed_filename)
+if step_index > 0 and st.session_state.get("duplicate_files"):
+    st.info("以下文件内容完全相同，已仅保留一份，避免重复报销：")
+    for duplicate in st.session_state.duplicate_files:
+        st.text(f"{duplicate['filename']} → 保留 {duplicate['original']}")
 
 # ========== 步骤1：上传文件 ==========
 if step_index == 0:
@@ -335,7 +371,23 @@ if step_index == 0:
                 extractor.cleanup()
                 st.error(f"❌ ZIP 文件包含不安全路径，已拒绝处理：{exc}")
                 st.stop()
+            except (RuntimeError, OSError):
+                extractor.cleanup()
+                st.error("❌ 压缩包无法解压，请确认未加密且文件完整后重新上传。")
+                st.stop()
+            if not file_list:
+                extractor.cleanup()
+                st.error("压缩包中没有支持的 PDF 或图片，请检查文件后重新上传。")
+                st.stop()
+            if st.session_state.extractor:
+                st.session_state.extractor.cleanup()
             st.session_state.extractor = extractor
+            st.session_state.duplicate_files = extractor.duplicate_files
+            _clear_editor_widgets()
+            st.session_state.generated_excel = None
+            st.session_state.generated_excel_fingerprint = None
+            st.session_state.travel_days = {}
+            st.session_state.pop("confirm_partial_export", None)
 
             img_count, pdf_count = extractor.get_file_count()
             st.info(
@@ -354,7 +406,7 @@ if step_index == 0:
                 )
 
         # 解析发票
-        with st.spinner("🤖 正在调用 AI 识别发票..."):
+        with st.spinner("🔎 正在识别发票..."):
             progress_bar = st.progress(0)
             status_text = st.empty()
 
@@ -412,7 +464,7 @@ if step_index == 0:
                 + "、".join(
                     f"{city}({days}天)" for city, days in travel_days.items()
                 )
-                + f"，共{sum(travel_days.values())}天"
+                + f"，自然日共{generator.total_travel_days(travel_days)}天"
             )
 
         # 火车票往返配对校验
@@ -440,8 +492,10 @@ elif step_index == 1:
     # ---- 汇总摘要 ----
     from collections import Counter
     type_counts = Counter(inv.get("type", "其他") for inv in invoices)
-    summary_parts = [f"{t}: {c}张" for t, c in type_counts.items()]
-    st.info(f"📊 共 {len(invoices)} 张票据 — " + "、".join(summary_parts))
+    summary_parts = [f"{t}: {c}条" for t, c in type_counts.items()]
+    st.info(f"📊 共 {len(invoices)} 条记录 — " + "、".join(summary_parts))
+    st.caption("编辑内容会自动保留；保存或进入生成页时，会校验数据并更新出差天数。请核对日期、路线和金额是否与原单一致。")
+    st.caption("打车发票与行程单按金额、日期关联；相同金额的不同订单仍需对照原单核对。")
 
     # ---- 分类 tabs ----
     # 定义分类顺序和图标
@@ -478,7 +532,7 @@ elif step_index == 1:
         with container:
             # 分类小计
             cat_total = sum(_amount_or_zero(inv.get("amount", 0)) for _, inv in items)
-            st.caption(f"{len(items)} 张，合计 ¥{cat_total:.2f}")
+            st.caption(f"{len(items)} 条，合计 ¥{cat_total:.2f}")
 
             for i, inv in items:
                 with st.expander(
@@ -559,36 +613,22 @@ elif step_index == 1:
 
     st.session_state.invoices = edited_invoices
 
+    normalized, validation_errors = _validated_invoices(edited_invoices)
+    if validation_errors:
+        st.session_state.generated_excel = None
+        st.session_state.generated_excel_fingerprint = None
+        st.error("请先修正以下内容：\n" + "\n".join(f"- {item}" for item in validation_errors))
+
     # 保存修改按钮
     if st.button("💾 保存修改", type="primary", use_container_width=True):
-        validation_errors = []
-        for i, inv in enumerate(edited_invoices):
-            date_fields = [("日期", inv.get("date", ""))]
-            if inv.get("type") == "酒店":
-                date_fields.extend([
-                    ("入住日期", inv.get("check_in_date", "")),
-                    ("离店日期", inv.get("check_out_date", "")),
-                ])
-            for field_name, field_value in date_fields:
-                if not _date_is_valid(field_value):
-                    validation_errors.append(f"第 {i + 1} 条{field_name}不是 YYYY-MM-DD 格式")
-            try:
-                amount = float(inv.get("amount", 0))
-                if amount < 0:
-                    validation_errors.append(f"第 {i + 1} 条金额不能为负数")
-            except (TypeError, ValueError):
-                validation_errors.append(f"第 {i + 1} 条金额不是有效数字")
         if validation_errors:
-            st.error("请先修正以下内容：\n" + "\n".join(f"- {item}" for item in validation_errors))
             st.stop()
-        for inv in edited_invoices:
-            inv["amount"] = float(inv.get("amount", 0))
-        st.session_state.invoices = edited_invoices
+        st.session_state.invoices = normalized
         # 编辑日期/地点/酒店入住日期后立即同步出差天数，避免生成报销单仍使用旧统计。
         template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
         st.session_state.template_bytes = template_bytes
         generator = ExcelGenerator(template_bytes)
-        st.session_state.travel_days = generator.calculate_travel_days(edited_invoices)
+        st.session_state.travel_days = generator.calculate_travel_days(normalized)
         st.session_state.generated_excel = None  # 清除已生成的Excel，步骤3重新生成
         st.session_state.generated_excel_fingerprint = None
         st.success("✅ 修改已保存，正在跳转...")
@@ -603,10 +643,12 @@ elif step_index == 1:
     recalc_col, hint_col = st.columns([1, 3])
     with recalc_col:
         if st.button("🔄 重新计算", use_container_width=True):
+            if validation_errors:
+                st.stop()
             template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
             st.session_state.template_bytes = template_bytes
             generator = ExcelGenerator(template_bytes)
-            st.session_state.travel_days = generator.calculate_travel_days(st.session_state.invoices)
+            st.session_state.travel_days = generator.calculate_travel_days(normalized)
             st.session_state.generated_excel = None
             st.session_state.generated_excel_fingerprint = None
             st.rerun()
@@ -617,8 +659,11 @@ elif step_index == 1:
         cols = st.columns(len(travel_days) + 1)
         for idx, (city, days) in enumerate(travel_days.items()):
             cols[idx].metric(label=city, value=f"{days}天")
-        total_days = sum(travel_days.values())
-        cols[-1].metric(label="合计", value=f"{total_days}天")
+        stats_generator = ExcelGenerator(st.session_state.get("template_bytes") or get_builtin_template_bytes())
+        stats_generator.calculate_travel_days(normalized if not validation_errors else [])
+        total_days = stats_generator.total_travel_days(travel_days)
+        cols[-1].metric(label="自然日合计", value=f"{total_days}天")
+        st.caption("出发日和返回日均计入；同日跨城市会出现在各城市统计中，但总天数和补贴只计一次。缺少行程依据时请核对原单。")
     else:
         st.info("暂无出差天数统计")
 
@@ -636,8 +681,16 @@ elif step_index == 2:
         st.session_state.template_bytes = get_builtin_template_bytes()
 
     # 数据汇总
-    invoices = st.session_state.invoices
-    travel_days = st.session_state.get("travel_days", {})
+    invoices, validation_errors = _validated_invoices(st.session_state.invoices)
+    if validation_errors:
+        st.session_state.generated_excel = None
+        st.session_state.generated_excel_fingerprint = None
+        st.error("无法生成报销单，请返回预览页修正：\n" + "\n".join(f"- {item}" for item in validation_errors))
+        st.stop()
+    st.session_state.invoices = invoices
+    generator = ExcelGenerator(st.session_state.template_bytes)
+    travel_days = generator.calculate_travel_days(invoices)
+    st.session_state.travel_days = travel_days
     work_description = st.session_state.get("work_description", "")
 
     st.subheader("📊 数据汇总")
@@ -647,16 +700,16 @@ elif step_index == 2:
         if inv.get("type") == "餐饮" and not inv.get("is_entertainment", False)
     )
     total_reimburse = total_all - meal_exclude
-    total_days = sum(travel_days.values())
+    total_days = generator.total_travel_days(travel_days)
     subsidy = total_days * 50
     generation_fingerprint = _generation_fingerprint(invoices, travel_days, work_description)
 
     # 2x2 布局（窄屏友好）
     row1_col1, row1_col2 = st.columns(2)
     with row1_col1:
-        st.metric("票据总数", f"{len(invoices)} 张")
+        st.metric("记录总数", f"{len(invoices)} 条")
     with row1_col2:
-        st.metric("报销总金额", f"¥{total_reimburse:.2f}")
+        st.metric("导出总金额", f"¥{total_reimburse + subsidy + 700:.2f}")
 
     row2_col1, row2_col2 = st.columns(2)
     with row2_col1:
@@ -666,6 +719,13 @@ elif step_index == 2:
 
     if meal_exclude > 0:
         st.caption(f"含票据¥{total_all:.2f}，已扣除补贴替票餐费¥{meal_exclude:.2f}")
+    st.caption(f"费用金额 ¥{total_reimburse:.2f}，另加出差补贴（50元/天）、通讯补贴200元和餐补500元。")
+    if st.session_state.get("failed_files"):
+        if not st.checkbox("我已核对未识别文件，知道导出不包含这些费用", key="confirm_partial_export"):
+            st.session_state.generated_excel = None
+            st.session_state.generated_excel_fingerprint = None
+            st.info("请先核对上方未识别文件；需要补齐时，请返回上传页重新识别。")
+            st.stop()
 
     st.divider()
 
@@ -674,6 +734,8 @@ elif step_index == 2:
         not st.session_state.generated_excel
         or st.session_state.get("generated_excel_fingerprint") != generation_fingerprint
     ):
+        st.session_state.generated_excel = None
+        st.session_state.generated_excel_fingerprint = None
         with st.spinner("🔄 正在生成报销单..."):
             try:
                 template_bytes = st.session_state.get("template_bytes") or get_builtin_template_bytes()
