@@ -4,6 +4,7 @@ import re
 import base64
 from typing import List, Dict, Optional
 from utils.file_utils import image_to_base64, get_image_mime_type
+from services.didi_parser import is_didi, parse_itinerary, summary_matches
 
 
 class InvoiceParser:
@@ -58,10 +59,11 @@ class InvoiceParser:
     def __init__(self, api_key: str, model: str = "qwen-vl-max"):
         self.api_key = api_key
         self.model = model
+        self.failed_files = []
 
     def parse_single_invoice(
         self, image_path: str, system_prompt: str = "", invoice_parse_prompt: str = "",
-        page_text: str = "",
+        page_text: str = "", page_images=None, force_vision=False,
     ):
         """
         解析单张发票/行程单
@@ -72,20 +74,47 @@ class InvoiceParser:
             单个字典或字典列表（打车行程单可能返回多条记录）
         """
         # 第1优先：正则解析（零AI调用，结构化PDF专用）
-        if page_text:
+        if page_text and not force_vision:
             regex_result = self._try_parse_regex(page_text)
             if regex_result is not None:
                 return regex_result
 
         # 第2优先：文本模型（低成本，文本型PDF）
-        if page_text and len(page_text) > 80:
+        if page_text and len(page_text) > 80 and not force_vision:
             result = self._parse_with_text_model(page_text, invoice_parse_prompt)
-            if result is not None:
+            if result is not None and (not is_didi(page_text) or self._valid_didi_result(page_text, result)):
                 return result
             print(f"文本模型解析失败，回退视觉模型: {image_path}")
 
         # 第3优先：视觉模型（照片/扫描件）
-        return self._parse_with_vision_model(image_path, system_prompt, invoice_parse_prompt)
+        images = page_images if page_images is not None else [image_path]
+        records = []
+        for image in images:
+            result = self._parse_with_vision_model(image, system_prompt, invoice_parse_prompt)
+            if not result:
+                return None  # 任一页失败时不返回不完整的报销数据。
+            records.extend(result if isinstance(result, list) else [result])
+        if is_didi(page_text) and not self._valid_didi_result(page_text, records):
+            return None
+        if len(images) == 1 and len(records) == 1:
+            return records[0]
+        return records or None
+
+    def _valid_didi_result(self, text, result):
+        records = result if isinstance(result, list) else [result]
+        if not summary_matches(text, records):
+            return False
+        try:
+            return all(
+                item.get("type") == "打车行程单"
+                and item.get("start_location") and item.get("end_location")
+                and item.get("car_type")
+                and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", item.get("time", ""))
+                and self._validate_parsed_result(item)
+                for item in records
+            )
+        except (TypeError, ValueError, AttributeError):
+            return False
 
     def _try_parse_regex(self, text: str):
         """
@@ -96,7 +125,7 @@ class InvoiceParser:
         """
         result = None
 
-        if '滴滴出行' in text and '行程单' in text:
+        if is_didi(text):
             result = self._regex_didi_itinerary(text)
         elif '电子发票' in text and '旅客运输服务' in text:
             return {'type': '_skip', 'reason': '滴滴发票无需解析'}
@@ -129,97 +158,7 @@ class InvoiceParser:
         return result
 
     def _regex_didi_itinerary(self, text: str):
-        """正则解析滴滴出行行程单（全部行程）"""
-        # 提取年份
-        ym = re.search(r'(?:行程起止日期|申请日期)[：:]\s*(\d{4})', text)
-        year = ym.group(1) if ym else '2026'
-
-        # 提取总行程数用于校验
-        total_match = re.search(r'共(\d+)笔行程', text)
-        expected_count = int(total_match.group(1)) if total_match else 0
-
-        # 去掉header部分（避免“合计334.85元”等干扰）
-        table_start = text.find('备注')
-        if table_start == -1:
-            table_start = text.find('里程')
-        trip_text = text[table_start:] if table_start >= 0 else text
-
-        # 部分滴滴 PDF 会在页宽不足时把上车时间拆成两行，例如
-        # "16:\\n17"。只修复时间内部的换行，避免影响地址的真实换行。
-        trip_text = re.sub(r'(\d{2}):\s*\n\s*(\d{2})', r'\1:\2', trip_text)
-
-        # 提取所有日期和时间
-        date_time_matches = re.findall(
-            r'(\d{2}-\d{2})\s+(\d{2}:\d{2})\s*[\n]?\s*[\u4e00-\u9fff]{1,2}',
-            trip_text,
-        )
-        dates = [m[0] for m in date_time_matches]
-        times = [m[1] for m in date_time_matches]
-        # 提取所有金额（2位小数）
-        amounts = re.findall(r'(?<!\d)(\d{1,3}\.\d{2})(?!\d)', trip_text)
-
-        if not dates or not amounts or len(dates) != len(amounts):
-            return None  # 解析不完整，回退AI
-
-        # ★ 准确率校验
-        if expected_count and len(dates) != expected_count:
-            print(f"⚠️ 行程数不匹配: 期望{expected_count}条，正则提取{len(dates)}条，回退AI")
-            return None
-        for amt in amounts:
-            if float(amt) > 400:
-                print(f"⚠️ 异常金额: ¥{amt}，回退AI")
-                return None
-
-        # 提取车型（用于顺风车/拼车标记）
-        car_types = self._extract_car_types(trip_text)
-
-        # 提取地点
-        segments = re.split(r'\d{2}-\d{2}\s+\d{2}:\d{2}\s*[\n]?\s*[\u4e00-\u9fff]{1,2}', trip_text)
-        locations = []
-        for i in range(1, len(segments)):
-            seg = segments[i]
-            # 去掉残余的周几字符（如 split 没完全匹配到的 周一/周二 第二字）
-            seg = re.sub(r'^[\s\n]*[一二三四五六日][\s\n]*', '', seg)
-            # 去掉城市名前缀（城市名可能独占一行，"市"在下一行）
-            seg = re.sub(r'^[\s\n]*[\u4e00-\u9fff]{1,4}\n市\n', '', seg)
-            seg = re.sub(r'^[\s\n]*[\u4e00-\u9fff]{1,4}市[\s\n]*', '', seg)
-            seg = re.sub(r'^[\s\n]*市[\s\n]*', '', seg)
-            seg = re.sub(r'\n\d+\.?\d*\n\d+\.\d{2}.*$', '', seg, flags=re.DOTALL)
-            parts = self._prepare_didi_location_lines(seg)
-            start_raw, end_raw = self._split_didi_locations(parts)
-            if start_raw or end_raw:
-                start = self._clean_location(start_raw)
-                end = self._clean_location(end_raw)
-                locations.append((start, end))
-            else:
-                locations.append((parts[0] if parts else '', ''))
-
-        trips = []
-        for i in range(len(dates)):
-            month_day = dates[i]
-            loc = locations[i] if i < len(locations) else ('', '')
-            car_type = car_types[i] if i < len(car_types) else ''
-            time_str = times[i] if i < len(times) else ''
-            # 仅顺风车需要餐饮发票替票（拼车有发票）
-            need_substitute = '顺风车' in car_type
-            trips.append({
-                'type': '打车行程单',
-                'date': f'{year}-{month_day}',
-                'time': time_str,
-                'trip_index': i + 1,
-                'start_location': loc[0],
-                'end_location': loc[1],
-                'amount': float(amounts[i]) if i < len(amounts) else 0,
-                'car_type': car_type,
-                'need_substitute': need_substitute,
-                'hotel_name': '',
-                'nights': '',
-                'daily_rate': '',
-                'has_invoice': False,
-                'raw_text': f'行程{i+1}: {year}-{month_day} {time_str} {loc[0]}-{loc[1]} ¥{amounts[i] if i < len(amounts) else "?"} [{car_type}]',
-            })
-
-        return trips if trips else None
+        return parse_itinerary(text, self)
 
     def _prepare_didi_location_lines(self, seg: str) -> List[str]:
         """清理滴滴单条行程中的地点行，保留可用于恢复换行地址的部分。"""
@@ -236,6 +175,8 @@ class InvoiceParser:
         )
 
         for p in parts:
+            if re.match(r'^页码\s*[:：]\s*\d+\s*/\s*\d+$', p):
+                continue
             if p in skip_words:
                 continue
             if car_type_pattern.match(p):
@@ -266,6 +207,11 @@ class InvoiceParser:
             pipe_idx = pipe_indexes[0]
             if pipe_idx == 0:
                 if len(parts) >= 3:
+                    # 终点有跨行括号而起点已完整时，续行应归终点。
+                    def depth(value):
+                        return value.count('(') + value.count('（') - value.count(')') - value.count('）')
+                    if depth(parts[0]) == 0 and depth(parts[1]) > 0 and depth(''.join(parts[1:])) == 0:
+                        return parts[0], ''.join(parts[1:])
                     return ''.join(parts[:-1]), parts[-1]
                 return parts[0], parts[1]
             return ''.join(parts[:pipe_idx]), ''.join(parts[pipe_idx:])
@@ -793,8 +739,13 @@ class InvoiceParser:
         if amount > MAX_AMOUNT.get(inv_type, 10000):
             return False
 
-        # 3. 日期必须存在且格式正确
+        # 3. 不仅检查格式，还验证日历日期，拒绝 02-30 等无效日期。
         if not date or not re.match(r'\d{4}-\d{2}-\d{2}$', date):
+            return False
+        try:
+            from datetime import date as calendar_date
+            calendar_date.fromisoformat(date)
+        except ValueError:
             return False
 
         # 4. 日期必须在合理范围内（2020-2030）
@@ -813,7 +764,7 @@ class InvoiceParser:
         return True
 
     def _parse_with_text_model(self, page_text: str, invoice_parse_prompt: str = ""):
-        """使用纯文本模型解析PDF提取的文字（更精确、不会遗漏）"""
+        """使用纯文本模型解析PDF提取的文字。"""
         try:
             from dashscope import Generation
             import dashscope
@@ -929,46 +880,53 @@ class InvoiceParser:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
+        self.failed_files = []
 
         # 构建任务列表
         # 文本型PDF：合并所有页文字为一个任务（节省AI调用）
-        # 图片/扫描件：每页一个任务
+        # 图片/扫描件：整份文件一个任务，保证后备视觉识别覆盖每一页。
         tasks = []
         for file_rank, file_info in enumerate(file_list):
             images = file_info.get("images", [])
             page_texts = file_info.get("page_texts", [])
             all_text = "\n\n".join(pt for pt in page_texts if pt)
 
-            if all_text and len(all_text) > 80:
-                # 文本型PDF：合并所有页为一个任务
-                tasks.append((images[0] if images else "", file_info["filename"], all_text, file_rank))
-            else:
-                # 图片/扫描件：每页一个任务
-                for img_path in images:
-                    tasks.append((img_path, file_info["filename"], "", file_rank))
+            # 有扫描页时不能只凭其他页的文字判断整份文件已识别完整。
+            force_vision = (
+                len(images) > len(page_texts)
+                or any(not pt.strip() for pt in page_texts)
+            )
+            tasks.append((images, file_info["filename"], all_text, file_rank, force_vision))
 
         results = []
         results_lock = threading.Lock()
         completed = [0]  # 用列表以便在闭包中修改
         total = len(tasks)
 
-        def _parse_one(img_path, filename, page_text="", file_rank=0):
+        def _parse_one(images, filename, page_text="", file_rank=0, force_vision=False):
             """解析单张图片（线程安全），可能返回多条记录（打车行程单）"""
             result = self.parse_single_invoice(
-                img_path, system_prompt, invoice_parse_prompt, page_text=page_text
+                images[0] if images else "", system_prompt, invoice_parse_prompt,
+                page_text=page_text, page_images=images, force_vision=force_vision,
             )
             # 跳过不需要解析的文件（如滴滴发票）
-            if isinstance(result, dict) and result.get('type') == '_skip':
+            skipped = isinstance(result, dict) and result.get('type') == '_skip'
+            if skipped:
                 result = None
             if result is not None:
                 if isinstance(result, list):
-                    for r in result:
+                    for index, r in enumerate(result, 1):
                         r["source_file"] = filename
                         r["source_file_rank"] = file_rank
+                        if r.get("type") == "打车行程单":
+                            r["trip_index"] = index
+                            r["need_substitute"] = "顺风车" in r.get("car_type", "")
                 else:
                     result["source_file"] = filename
                     result["source_file_rank"] = file_rank
             with results_lock:
+                if not result and not skipped:
+                    self.failed_files.append(filename)
                 completed[0] += 1
                 if progress_callback:
                     try:
@@ -979,8 +937,8 @@ class InvoiceParser:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
-                executor.submit(_parse_one, img_path, fn, pt, file_rank): (img_path, fn)
-                for img_path, fn, pt, file_rank in tasks
+                executor.submit(_parse_one, images, fn, pt, file_rank, force): fn
+                for images, fn, pt, file_rank, force in tasks
             }
             for future in as_completed(future_to_task):
                 try:
@@ -991,7 +949,8 @@ class InvoiceParser:
                         else:
                             results.append(result)
                 except Exception as e:
-                    _, fn = future_to_task[future]
+                    fn = future_to_task[future]
+                    self.failed_files.append(fn)
                     print(f"解析失败: {fn}, 错误: {e}")
 
         # 按日期排序

@@ -14,10 +14,11 @@
 
 ➊ 打车行程单（type=打车行程单）：行程单上通常有多条行程，请将每一条行程单独提取出来，返回JSON数组：
 [
-    {"type": "打车行程单", "date": "YYYY-MM-DD（年份从页面上的行程起止日期或申请日期推断）", "start_location": "起点地址（去掉城市和区域前缀）", "end_location": "终点地址（去掉城市和区域前缀）", "amount": "金额", "hotel_name": "", "nights": "", "daily_rate": "", "has_invoice": true, "raw_text": "该条行程的原始文字"},
+    {"type": "打车行程单", "date": "YYYY-MM-DD（按行程起止日期确定年份，跨年分别填写；不能用申请年份代替行程年份）", "time": "HH:MM", "trip_index": 1, "car_type": "该行车型", "need_substitute": false, "start_location": "起点地址（去掉城市和区域前缀）", "end_location": "终点地址（去掉城市和区域前缀）", "amount": 30.00, "hotel_name": "", "nights": "", "daily_rate": "", "has_invoice": false, "raw_text": "该条行程的原始文字"},
     ...
 ]
 每条行程一个对象，有多少条就提取多少条，不得遗漏。
+金额填写该行金额列的数字，不取里程；只识别当前图片实际列出的行程，不根据总笔数虚构其他页记录。车型按当前行读取，只有顺风车将 need_substitute 设为 true。时间或地址跨行时先拼接再读取。年份无法确认时 date 留空，不猜测。
 
 ➋ 其他类型票据：返回单个JSON对象：
 {

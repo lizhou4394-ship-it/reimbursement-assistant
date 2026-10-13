@@ -278,6 +278,10 @@ st.divider()
 
 # 根据 current_step 确定当前步骤
 step_index = st.session_state.current_step
+if step_index > 0 and st.session_state.get("failed_files"):
+    st.warning("以下文件未完整识别，当前报销数据不包含这些文件。请返回上传页重试；若继续导出，请根据原单在 Excel 中补齐：")
+    for failed_filename in st.session_state.failed_files:
+        st.text(failed_filename)
 
 # ========== 步骤1：上传文件 ==========
 if step_index == 0:
@@ -373,8 +377,14 @@ if step_index == 0:
             )
 
             st.session_state.invoices = invoices
+            st.session_state.failed_files = parser.failed_files
             progress_bar.progress(1.0)
-            status_text.text(f"✅ 发票识别完成，共识别 {len(invoices)} 张票据")
+            status_text.text(f"识别结束，共取得 {len(invoices)} 条记录，{len(parser.failed_files)} 个文件未完整识别")
+            if not invoices:
+                st.error("没有取得可用记录。请检查文件是否清晰、完整，并确认识别服务配置后重试。")
+                for failed_filename in parser.failed_files:
+                    st.text(failed_filename)
+                st.stop()
 
         # 数据关联智能体：打车发票+行程单配对、快递明细去重、工作内容匹配
         with st.spinner("🔗 正在运行关联智能体（打车配对 + 快递明细整理 + 工作内容匹配）..."):
@@ -412,7 +422,7 @@ if step_index == 0:
         else:
             st.success("✅ 火车票往返配对检查正常")
 
-        st.success("🎉 所有文件解析完成！正在跳转到预览页面...")
+        st.info("识别流程结束，正在跳转到预览页面核对结果。")
         st.session_state.current_step = 1
         st.rerun()
 
