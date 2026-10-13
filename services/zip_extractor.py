@@ -1,6 +1,7 @@
 """压缩包解压服务"""
 import os
 import zipfile
+import hashlib
 from pathlib import Path
 import fitz  # PyMuPDF
 from typing import List, Dict, Tuple
@@ -34,8 +35,10 @@ class ZipExtractor:
             f.write(zip_bytes)
 
         # 安全解压：拒绝绝对路径、父目录跳转和符号链接，避免 ZIP 路径穿越。
+        source_dir = os.path.join(self.temp_dir, "sources")
+        os.makedirs(source_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            temp_root = Path(self.temp_dir).resolve()
+            temp_root = Path(source_dir).resolve()
             for member in zip_ref.infolist():
                 member_path = (temp_root / member.filename).resolve()
                 if temp_root != member_path and temp_root not in member_path.parents:
@@ -44,11 +47,11 @@ class ZipExtractor:
                 mode = (member.external_attr >> 16) & 0o170000
                 if mode == 0o120000:
                     raise ValueError(f"压缩包包含不支持的符号链接: {member.filename}")
-            zip_ref.extractall(self.temp_dir)
+            zip_ref.extractall(source_dir)
 
         # 遍历解压后的文件
         self.extracted_files = []
-        for root, dirs, files in os.walk(self.temp_dir):
+        for root, dirs, files in os.walk(source_dir):
             for filename in files:
                 if filename == "upload.zip":
                     continue
@@ -56,8 +59,9 @@ class ZipExtractor:
                     continue
 
                 filepath = os.path.join(root, filename)
+                relative_name = os.path.relpath(filepath, source_dir).replace("\\", "/")
                 file_info = {
-                    "filename": filename,
+                    "filename": relative_name,
                     "filepath": filepath,
                     "type": "pdf" if is_pdf(filename) else "image",
                     "images": [],
@@ -110,6 +114,9 @@ class ZipExtractor:
         image_paths = []
         try:
             doc = fitz.open(pdf_path)
+            # 渲染文件与上传文件隔离；不同文件夹的同名 PDF 不得共用图片。
+            render_dir = os.path.join(self.temp_dir, "rendered", hashlib.sha256(pdf_path.encode("utf-8")).hexdigest())
+            os.makedirs(render_dir, exist_ok=True)
             base_name = os.path.splitext(pdf_name)[0]
 
             for page_num in range(len(doc)):
@@ -120,7 +127,7 @@ class ZipExtractor:
 
                 # 保存图片
                 img_name = f"{base_name}_page{page_num + 1}.png"
-                img_path = os.path.join(self.temp_dir, img_name)
+                img_path = os.path.join(render_dir, img_name)
                 pix.save(img_path)
                 image_paths.append(img_path)
 
