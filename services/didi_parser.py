@@ -14,6 +14,11 @@ def is_didi(text):
     return "滴滴出行" in compact and "行程单" in compact
 
 
+def is_taxi_itinerary(text):
+    compact = re.sub(r"\s+", "", normalize(text))
+    return "行程单" in compact and any(word in compact for word in ("滴滴", "网约车", "打车", "上车", "车型", "里程"))
+
+
 def itinerary_period(text):
     compact = re.sub(r"\s+", "", normalize(text))
     period = re.search(
@@ -34,8 +39,10 @@ def summary_matches(text, records):
     if not isinstance(records, list) or not records:
         return False
     compact = re.sub(r"\s+", "", normalize(text))
-    count = re.search(r"共(\d+)笔行程", compact)
-    total = re.search(r"合计([\d,]+(?:\.\d{1,2})?)元", compact)
+    count = re.search(r"(?:共|行程数量[:：]?)(\d+)(?:笔|条|次)行程", compact)
+    if not count:
+        count = re.search(r"行程数量[:：]?(\d+)(?:笔|条|次)?", compact)
+    total = re.search(r"(?:合计|总金额)(?:[\[(]元[\])])?[:：]?[¥￥]?([\d,]+(?:\.\d{1,2})?)(?:元)?", compact)
     if count and len(records) != int(count[1]):
         return False
     try:

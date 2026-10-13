@@ -4,7 +4,7 @@ import re
 import base64
 from typing import List, Dict, Optional
 from utils.file_utils import image_to_base64, get_image_mime_type
-from services.didi_parser import is_didi, parse_itinerary, summary_matches
+from services.didi_parser import is_didi, is_taxi_itinerary, parse_itinerary, summary_matches
 
 
 class InvoiceParser:
@@ -88,7 +88,7 @@ class InvoiceParser:
         # 第2优先：文本模型（低成本，文本型PDF）
         if page_text and len(page_text) > 80 and not force_vision:
             result = normalize_records(self._parse_with_text_model(page_text, invoice_parse_prompt))
-            if result is not None and (not is_didi(page_text) or self._valid_didi_result(page_text, result)):
+            if result is not None and self._train_count_matches(page_text, result) and (not is_taxi_itinerary(page_text) or self._valid_didi_result(page_text, result)):
                 return result
             print(f"文本模型解析失败，回退视觉模型: {image_path}")
 
@@ -96,7 +96,7 @@ class InvoiceParser:
         images = page_images if page_images is not None else [image_path]
         records = []
         context_prompt = invoice_parse_prompt
-        if is_didi(page_text):
+        if is_taxi_itinerary(page_text):
             from config import load_prompt
             context_prompt = (invoice_parse_prompt or load_prompt("invoice_parse")) + (
                 "\n以下是同一文件提取的文字，仅供确定年份和核对汇总；只提取当前图片实际显示的记录：\n"
@@ -109,11 +109,21 @@ class InvoiceParser:
             records.extend(result if isinstance(result, list) else [result])
         if any(self._is_refund_or_void(item.get("raw_text", "")) for item in records):
             return None
-        if is_didi(page_text) and not self._valid_didi_result(page_text, records):
+        if not self._train_count_matches(page_text, records):
+            return None
+        if is_taxi_itinerary(page_text) and not self._valid_didi_result(page_text, records):
             return None
         if len(images) == 1 and len(records) == 1:
             return records[0]
         return records or None
+
+    @staticmethod
+    def _train_count_matches(text, result):
+        if not any(word in text for word in ('中国铁路', '铁路电子客票', '12306')):
+            return True
+        expected = max(len(re.findall(r'票价\s*[:：]?\s*[¥￥]?\s*\d', text)), text.count('铁路电子客票'))
+        records = result if isinstance(result, list) else [result]
+        return expected <= 1 or sum(item.get('type') == '火车票' for item in records) == expected
 
     @staticmethod
     def _is_refund_or_void(text):
@@ -139,7 +149,7 @@ class InvoiceParser:
         """
         尝试用正则解析结构化PDF（零AI调用）
         支持：滴滴行程单、火车票、酒店、餐饮、快递、飞机票
-        跳过：滴滴发票（行程单已包含全部信息）
+        打车发票保留，关联阶段与行程单配对以避免重复计费。
         返回 None 表示无法正则解析，需回退AI
         """
         result = None
@@ -149,8 +159,11 @@ class InvoiceParser:
         if is_didi(text):
             result = self._regex_didi_itinerary(text)
         elif '电子发票' in text and '旅客运输服务' in text and '滴滴' in text:
-            return {'type': '_skip', 'reason': '滴滴发票无需解析'}
+            result = self._regex_didi_invoice(text)
         elif any(word in text for word in ('中国铁路', '铁路电子客票', '12306')) or ('车次' in text and '座位号' in text):
+            # 拼接或拼版的一页可能包含多张票，单票规则不能仅返回第一张。
+            if len(re.findall(r'票价\s*[:：]?\s*[¥￥]?\s*\d', text)) > 1 or text.count('铁路电子客票') > 1:
+                return None
             result = self._regex_train_ticket(text)
         elif any(kw in text for kw in ['住宿', '酒店', '客房', '宾馆', '旅馆']):
             result = self._regex_hotel(text)
@@ -309,7 +322,12 @@ class InvoiceParser:
         date_pattern = r'(\d{4})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})日?'
         time_pattern = r'(\d{1,2})\s*:\s*(\d{2})'
         # 日期与时间之间不允许跨越其他数字，避免开票日期吞掉乘车日期。
-        dm = re.search(date_pattern + r'[^\d]{0,40}' + time_pattern, text)
+        dm = re.search(r'(?:乘车日期|乘车时间|出发时间|开车时间)\s*[:：]?\s*' + date_pattern + r'[^\d]{0,40}' + time_pattern, text)
+        if not dm:
+            for candidate in re.finditer(date_pattern + r'[^\d]{0,40}' + time_pattern, text):
+                if '开票' not in text[max(0, candidate.start() - 12):candidate.start()]:
+                    dm = candidate
+                    break
         travel_date = None
         if dm:
             travel_date = f'{dm.group(1)}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}'
@@ -375,6 +393,10 @@ class InvoiceParser:
         因此优先用拼音站名判断方向，失败时再回退中文站名。
         """
         import re as _re
+        start = _re.search(r'(?:出发站|始发站|发站)\s*[:：]\s*([\u4e00-\u9fff]{2,12})', text)
+        end = _re.search(r'(?:到达站|终到站|到站)\s*[:：]\s*([\u4e00-\u9fff]{2,12})', text)
+        if start and end:
+            return start[1].removesuffix('站'), end[1].removesuffix('站')
         pinyin_stations = cls._extract_train_stations_from_pinyin(text)
         if len(pinyin_stations) >= 2:
             return pinyin_stations[0], pinyin_stations[1]
@@ -891,7 +913,7 @@ class InvoiceParser:
                 or any(not pt.strip() for pt in page_texts)
             )
             # 多页普通票据可能每页是一张独立车票，不能只读合并文字的第一张。
-            separate_pages = len(images) > 1 and not is_didi(all_text) and '运单明细' not in all_text
+            separate_pages = max(len(images), len(page_texts)) > 1 and not is_taxi_itinerary(all_text) and '运单明细' not in all_text
             tasks.append((images, file_info["filename"], all_text, file_rank, force_vision, page_texts if separate_pages else None))
 
         results = []
@@ -903,7 +925,8 @@ class InvoiceParser:
             """解析单张图片（线程安全），可能返回多条记录（打车行程单）"""
             if page_texts is not None:
                 result = []
-                for page_index, image in enumerate(images):
+                for page_index in range(max(len(images), len(page_texts))):
+                    image = images[page_index] if page_index < len(images) else ""
                     text = page_texts[page_index] if page_index < len(page_texts) else ""
                     parsed = self.parse_single_invoice(image, system_prompt, invoice_parse_prompt, page_text=text)
                     if not parsed:
@@ -960,7 +983,14 @@ class InvoiceParser:
                             results.append(result)
                 except Exception as e:
                     fn = future_to_task[future]
-                    self.failed_files.append(fn)
+                    with results_lock:
+                        self.failed_files.append(fn)
+                        completed[0] += 1
+                        if progress_callback:
+                            try:
+                                progress_callback(completed[0], total, fn)
+                            except Exception:
+                                pass
                     print(f"解析失败: {fn}, 错误: {e}")
 
         # 按日期排序
@@ -969,6 +999,8 @@ class InvoiceParser:
             x.get("source_file_rank", 0),
             int(x.get("trip_index", 0) or 0),
         ))
+        ranks = {info["filename"]: i for i, info in enumerate(file_list)}
+        self.failed_files.sort(key=lambda name: ranks.get(name, len(ranks)))
         return results
 
     def _extract_json(self, text: str):

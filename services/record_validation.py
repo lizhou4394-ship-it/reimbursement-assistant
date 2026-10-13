@@ -1,6 +1,7 @@
 """规则识别、AI、人工编辑和导出共同使用的数据约束。"""
 import re
 import unicodedata
+import math
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -31,7 +32,10 @@ def normalize_amount(value):
         raise ValueError("金额应为有效数字") from None
     if not amount.is_finite():
         raise ValueError("金额应为有限数字")
-    return float(amount)
+    result = float(amount)
+    if not math.isfinite(result):
+        raise ValueError("金额过大，无法有效表示")
+    return result
 
 
 def normalize_record(record, allow_zero=False):
@@ -42,6 +46,14 @@ def normalize_record(record, allow_zero=False):
         raise ValueError("费用类型无法识别")
     item["date"] = normalize_date(item.get("date"))
     item["amount"] = normalize_amount(item.get("amount"))
+    for key in ["has_invoice", "need_substitute", "is_entertainment"]:
+        if key in item:
+            value = item[key]
+            if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+                value = value.strip().lower() == "true"
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} 应为是或否")
+            item[key] = value
     if not allow_zero and item["amount"] <= 0:
         raise ValueError("票据金额必须大于零")
     for key in ["start_location", "end_location", "hotel_name", "work_content", "raw_text", "car_type"]:

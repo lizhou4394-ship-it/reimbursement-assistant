@@ -52,6 +52,18 @@ class ParserIntegrityTest(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual([r["date"] for r in result], ["2026-09-05", "2026-09-06"])
 
+    def test_two_tickets_on_one_page_fall_back_instead_of_returning_first(self):
+        text = train_text() + train_text("2026-09-06")
+        self.assertIsNone(self.parser._try_parse_regex(text))
+        with patch.object(self.parser, "_parse_with_text_model", return_value=[ticket(), ticket("2026-09-06")]):
+            result = self.parser.parse_single_invoice("p1", page_text=text)
+        self.assertEqual(len(result), 2)
+
+    def test_ai_cannot_silently_omit_second_ticket_on_same_page(self):
+        with patch.object(self.parser, "_parse_with_text_model", return_value=ticket()), \
+             patch.object(self.parser, "_parse_with_vision_model", return_value=ticket()):
+            self.assertIsNone(self.parser.parse_single_invoice("p1", page_text=train_text() + train_text("2026-09-06")))
+
     def test_train_invoice_is_not_skipped_as_taxi_invoice(self):
         result = self.parser._try_parse_regex(train_text(extra="*旅客运输服务*铁路运输"))
         self.assertEqual(result["type"], "火车票")
@@ -80,6 +92,31 @@ class ParserIntegrityTest(unittest.TestCase):
 
     def test_large_valid_hotel_amount_is_not_rejected(self):
         self.assertTrue(self.parser._validate_parsed_result({"type": "酒店", "date": "2026-09-05", "amount": 8000}))
+
+    def test_text_only_multipage_tickets_do_not_lose_second_page(self):
+        result = self.parser.parse_all_invoices([{"filename": "tickets.pdf", "images": [],
+                                                 "page_texts": [train_text(), train_text("2026-09-06")]}])
+        self.assertEqual(len(result), 2)
+
+    def test_other_provider_changed_layout_checks_summary_before_accepting_ai(self):
+        text = "高德打车行程单\n行程数量：2条\n总金额(元)：60.00\n" + "新格式内容 " * 20
+        trip = {"type": "打车行程单", "date": "2026-09-05", "time": "12:00", "amount": 30,
+                "start_location": "温州南", "end_location": "客户", "car_type": "快车"}
+        with patch.object(self.parser, "_parse_with_text_model", return_value=[trip]), \
+             patch.object(self.parser, "_parse_with_vision_model", return_value=[trip, {**trip, "time": "13:00"}]) as vision:
+            result = self.parser.parse_single_invoice("p1", page_text=text)
+        self.assertEqual(len(result), 2)
+        vision.assert_called_once()
+
+    def test_unknown_provider_multipage_context_is_preserved(self):
+        text = "高德打车行程单\n行程数量：2条\n总金额(元)：60.00"
+        trip = {"type": "打车行程单", "date": "2026-09-05", "time": "12:00", "amount": 30,
+                "start_location": "温州南", "end_location": "客户", "car_type": "快车"}
+        with patch.object(self.parser, "_parse_with_vision_model", side_effect=[[trip], [{**trip, "time": "13:00"}]]) as vision:
+            result = self.parser.parse_all_invoices([{"filename": "other.pdf", "images": ["p1", "p2"], "page_texts": [text, ""]}])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(vision.call_count, 2)
+        self.assertTrue(all("高德" in call.args[2] for call in vision.call_args_list))
 
 
 if __name__ == "__main__":
